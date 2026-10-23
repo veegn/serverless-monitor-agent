@@ -444,10 +444,14 @@ pub fn disk_usage_linux() -> (u64, u64, Vec<DiskDeviceRef>) {
                             has_device,
                         };
 
-                        let fsid_val = st.f_fsid;
                         let fsid_key = {
-                            let v0 = fsid_val.__val[0];
-                            let v1 = fsid_val.__val[1];
+                            let (v0, v1): (libc::c_int, libc::c_int) = unsafe {
+                                if std::mem::size_of::<libc::fsid_t>() == std::mem::size_of::<(libc::c_int, libc::c_int)>() {
+                                    std::mem::transmute_copy(&st.f_fsid)
+                                } else {
+                                    (0, 0)
+                                }
+                            };
                             if v0 == 0 && v1 == 0 {
                                 String::new()
                             } else {

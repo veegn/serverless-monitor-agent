@@ -625,6 +625,22 @@ pub fn service_system(_paths: &Paths) -> &'static str {
     "windows"
 }
 
+pub fn write_service(paths: &Paths, debug: bool) -> Result<(), String> {
+    write_windows_service(paths, debug)
+}
+
+pub fn launchd_domain(_paths: &Paths) -> String {
+    String::new()
+}
+
+pub fn launchd_plist(_paths: &Paths) -> String {
+    String::new()
+}
+
+pub fn synology_service_file(_paths: &Paths) -> String {
+    String::new()
+}
+
 pub fn write_windows_service(paths: &Paths, debug: bool) -> Result<(), String> {
     write_windows_task_wrapper(paths, debug)?;
     let _ = run_command_quiet("schtasks", &["/Delete", "/TN", &paths.service_name, "/F"]);
