@@ -1,24 +1,27 @@
+//! Serverless Monitor Agent (`sma`).
+//!
+//! Module layout:
+//! - [`agent`]: runtime orchestration (event loop, collection, reporting)
+//! - [`transport`]: WebSocket report session with the Worker
+//! - [`net`]: low-level HTTP / WebSocket / DNS / probe clients
+//! - [`storage`]: config file, offline cache, traffic accounting
+//! - [`metrics`]: per-platform system metric collection
+//! - [`platform`]: per-platform service management and paths
+//! - [`cli`]: command line entry, install / uninstall
+//! - [`update`]: self-update from GitHub releases
+//! - [`types`]: shared data types and constants
+//! - [`util`]: logging, clock, command helpers
+
 pub mod agent;
-pub mod cache;
 pub mod cli;
-pub mod clock;
-pub mod command;
-pub mod config;
-pub mod dns;
-pub mod http;
-pub mod install;
-pub mod install_summary;
-pub mod iplookup;
-pub mod legacy;
-pub mod log;
 pub mod metrics;
+pub mod net;
 pub mod platform;
-pub mod probe;
-pub mod traffic;
+pub mod storage;
 pub mod transport;
 pub mod types;
 pub mod update;
-pub mod websocket;
+pub mod util;
 
 pub use agent::AgentError;
 pub use cli::execute;

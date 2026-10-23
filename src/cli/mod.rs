@@ -1,9 +1,16 @@
+//! Command line entry point: argument parsing and the `install`, `run`,
+//! `uninstall` and `version` commands.
+
+pub mod install;
+pub mod legacy;
+pub mod summary;
+
 use crate::agent::{run, AgentError};
-use crate::config::{
+use crate::storage::config::{
     default_config, normalize_binary_value, normalize_config_intervals, normalize_connection_mode,
     normalize_interface_list, normalize_ping_mode,
 };
-use crate::install::{install, uninstall, LEGACY_AGENT_VERSION};
+use crate::cli::install::{install, uninstall, LEGACY_AGENT_VERSION};
 use crate::types::*;
 use crate::update::apply_scheduled_update;
 use std::collections::HashSet;

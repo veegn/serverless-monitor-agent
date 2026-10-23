@@ -1,5 +1,5 @@
-use crate::command::{command_exists, command_output, quote_shell, run_command_quiet};
-use crate::http::{download_to_file, get};
+use crate::util::command::{command_exists, command_output, quote_shell, run_command_quiet};
+use crate::net::http::{download_to_file, get};
 use crate::platform::{
     apply_windows_scheduled_update, default_paths, is_synology, native_arch,
 };

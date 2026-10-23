@@ -1,4 +1,4 @@
-use serverless_monitor_agent::iplookup::{
+use serverless_monitor_agent::net::iplookup::{
     extract_ip_from_body, IPV4_LOOKUP_ENDPOINTS, IPV6_LOOKUP_ENDPOINTS,
 };
 

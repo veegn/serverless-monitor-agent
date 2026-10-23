@@ -1,4 +1,4 @@
-use serverless_monitor_agent::install_summary::{
+use serverless_monitor_agent::cli::summary::{
     format_management_command, management_commands, ManagementCommand,
 };
 use serverless_monitor_agent::types::Paths;

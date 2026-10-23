@@ -1,4 +1,4 @@
-use crate::command::{command_output, run_command, run_command_quiet};
+use crate::util::command::{command_output, run_command, run_command_quiet};
 use crate::types::*;
 use std::env;
 use std::fs;

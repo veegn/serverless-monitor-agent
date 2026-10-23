@@ -1,4 +1,4 @@
-use serverless_monitor_agent::config::{
+use serverless_monitor_agent::storage::config::{
     default_config, normalize_interface_list, read_config, write_config,
 };
 use serverless_monitor_agent::types::*;

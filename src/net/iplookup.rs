@@ -1,5 +1,5 @@
-use crate::http::get;
-use crate::log::Logger;
+use crate::net::http::get;
+use crate::util::log::Logger;
 use regex::Regex;
 use std::net::IpAddr;
 use std::sync::LazyLock;

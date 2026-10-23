@@ -1,4 +1,4 @@
-use crate::dns::resolve_host;
+use crate::net::dns::resolve_host;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use std::collections::HashMap;

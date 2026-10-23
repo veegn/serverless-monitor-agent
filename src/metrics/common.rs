@@ -1,4 +1,4 @@
-use crate::command::{command_exists, command_output};
+use crate::util::command::{command_exists, command_output};
 use crate::types::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;

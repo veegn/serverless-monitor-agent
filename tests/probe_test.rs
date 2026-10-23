@@ -1,4 +1,4 @@
-use serverless_monitor_agent::probe::{median_int, split_probe_target};
+use serverless_monitor_agent::net::probe::{median_int, split_probe_target};
 
 #[test]
 fn test_split_probe_target() {

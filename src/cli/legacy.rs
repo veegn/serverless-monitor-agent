@@ -1,5 +1,5 @@
-use crate::command::{command_exists, command_output, run_command_quiet};
-use crate::config::read_config;
+use crate::util::command::{command_exists, command_output, run_command_quiet};
+use crate::storage::config::read_config;
 use crate::platform::is_synology;
 use crate::types::*;
 use std::fs;

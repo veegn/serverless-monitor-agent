@@ -1,4 +1,4 @@
-use crate::command::command_output_checked;
+use crate::util::command::command_output_checked;
 use crate::metrics::common::*;
 use crate::types::*;
 use std::collections::HashSet;
@@ -58,7 +58,7 @@ pub fn read_memory_stats() -> (MemoryStats, bool) {
 pub fn read_net_bytes(ifaces: &str) -> Result<NetBytes, String> {
     let script = "Get-NetAdapterStatistics | ForEach-Object { \"$($_.Name),$($_.ReceivedBytes),$($_.SentBytes)\" }";
     let out = windows_powershell_output_checked(script)?;
-    let wanted = crate::config::split_interface_set(ifaces);
+    let wanted = crate::storage::config::split_interface_set(ifaces);
     let mut total = NetBytes::default();
     let mut matched = 0;
 

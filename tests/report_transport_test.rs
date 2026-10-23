@@ -77,12 +77,12 @@ fn test_wss_config_payload_string() {
 
 struct MockHost {
     config: Config,
-    logger: serverless_monitor_agent::log::Logger,
+    logger: serverless_monitor_agent::util::log::Logger,
     success_called: std::sync::atomic::AtomicBool,
 }
 
 impl serverless_monitor_agent::transport::TransportHost for MockHost {
-    fn logger(&self) -> serverless_monitor_agent::log::Logger {
+    fn logger(&self) -> serverless_monitor_agent::util::log::Logger {
         self.logger.clone()
     }
     fn config_snapshot(&self) -> Config {
@@ -194,7 +194,7 @@ fn test_report_transport_nonblocking_and_realtime_send() {
     };
     let host = Arc::new(MockHost {
         config,
-        logger: serverless_monitor_agent::log::Logger::new(false),
+        logger: serverless_monitor_agent::util::log::Logger::new(false),
         success_called: std::sync::atomic::AtomicBool::new(false),
     });
 

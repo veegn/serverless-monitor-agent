@@ -1,6 +1,6 @@
-use crate::config::{normalize_config_intervals, write_config};
-use crate::install_summary::{print_management_commands, print_probe_nodes};
-use crate::legacy::{cleanup_legacy_install, migrate_traffic, read_install_config};
+use crate::storage::config::{normalize_config_intervals, write_config};
+use crate::cli::summary::{print_management_commands, print_probe_nodes};
+use crate::cli::legacy::{cleanup_legacy_install, migrate_traffic, read_install_config};
 use crate::metrics::read_net_bytes;
 use crate::platform::{
     chmod_executable, copy_self_to, default_paths, ensure_platform_log_file,
@@ -8,7 +8,7 @@ use crate::platform::{
     service_system, start_service, stop_current_user_probe_instances, stop_service,
     write_service, deep_uninstall, check_install_conflicts,
 };
-use crate::traffic::{apply_traffic_correction, parse_traffic_correction_gb};
+use crate::storage::traffic::{apply_traffic_correction, parse_traffic_correction_gb};
 use crate::types::*;
 use std::path::Path;
 
@@ -39,7 +39,7 @@ pub fn install(mut opts: InstallOptions, version: &str) -> Result<(), String> {
     }
 
     if opts.name.is_empty() {
-        opts.name = crate::command::get_system_hostname();
+        opts.name = crate::util::command::get_system_hostname();
     }
 
     if !using_existing_config || opts.config_md5.is_empty() {

@@ -1,7 +1,7 @@
-use crate::dns::use_public_dns_resolver;
-use crate::log::Logger;
+use crate::net::dns::use_public_dns_resolver;
+use crate::util::log::Logger;
 use crate::types::*;
-use crate::websocket::{dial_websocket, WebSocketConn, WsError, WS_OPCODE_TEXT};
+use crate::net::websocket::{dial_websocket, WebSocketConn, WsError, WS_OPCODE_TEXT};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};

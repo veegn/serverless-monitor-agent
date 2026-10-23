@@ -1,4 +1,4 @@
-use crate::command::{command_line_count, command_output};
+use crate::util::command::{command_line_count, command_output};
 use crate::metrics::common::*;
 use crate::types::*;
 use std::collections::HashSet;
@@ -62,7 +62,7 @@ pub fn read_memory_stats() -> (MemoryStats, bool) {
 }
 
 pub fn read_net_bytes(ifaces: &str) -> Result<NetBytes, String> {
-    let wanted: HashSet<String> = crate::config::split_interface_set(ifaces);
+    let wanted: HashSet<String> = crate::storage::config::split_interface_set(ifaces);
     let out = command_output("netstat", &["-b", "-i", "-n"]);
     let mut total = NetBytes::default();
     let mut matched = 0;

@@ -1,5 +1,5 @@
-use crate::dns::resolve_host;
-use crate::http::create_tls_config;
+use crate::net::dns::resolve_host;
+use crate::net::http::create_tls_config;
 use ring::rand::SecureRandom;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, StreamOwned};

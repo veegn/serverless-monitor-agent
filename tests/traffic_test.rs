@@ -1,5 +1,5 @@
 use chrono::{DateTime, Local, TimeZone};
-use serverless_monitor_agent::traffic::{
+use serverless_monitor_agent::storage::traffic::{
     calc_monthly_traffic, period_start_ts, read_monthly_traffic_totals, read_traffic_state,
     write_traffic_state, TrafficState,
 };

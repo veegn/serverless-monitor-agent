@@ -1,14 +1,14 @@
-use crate::cache::{CachedSample, MetricsCache, BATCH_REPORT_SIZE};
-use crate::clock::CalibratedClock;
-use crate::command::run_command_quiet;
-use crate::config::{
+use crate::storage::cache::{CachedSample, MetricsCache, BATCH_REPORT_SIZE};
+use crate::util::clock::CalibratedClock;
+use crate::util::command::run_command_quiet;
+use crate::storage::config::{
     normalize_config_intervals, normalize_connection_mode, normalize_interface_list,
     normalize_ping_mode, read_config, write_config,
 };
-use crate::dns::use_public_dns_resolver;
-use crate::http::post;
-use crate::iplookup::lookup_public_ip;
-use crate::log::Logger;
+use crate::net::dns::use_public_dns_resolver;
+use crate::net::http::post;
+use crate::net::iplookup::lookup_public_ip;
+use crate::util::log::Logger;
 use crate::metrics::{
     collect_basic_stats, disk_io_stats_from_counters, read_cpu_percent, read_disk_io_counters,
     read_memory_stats, read_net_bytes, sample_metrics_to_map,
@@ -17,8 +17,8 @@ use crate::platform::{
     acquire_instance_lock, default_paths, native_arch, platform_name,
     service_system,
 };
-use crate::probe::{measure_probe, median_int};
-use crate::traffic::{
+use crate::net::probe::{measure_probe, median_int};
+use crate::storage::traffic::{
     apply_traffic_correction_from_network, calc_monthly_traffic, parse_traffic_correction_gb,
 };
 use crate::transport::{
@@ -225,7 +225,7 @@ impl TransportHost for Agent {
     }
 
     fn calibrate_date(&self, date_str: &str, rtt: Duration) {
-        if let Some(date_time) = crate::clock::parse_http_date(date_str) {
+        if let Some(date_time) = crate::util::clock::parse_http_date(date_str) {
             let clk = self.clock.lock().unwrap();
             let (snapshot, updated) = clk.update_date(date_time, rtt, SystemTime::now(), Instant::now());
             if updated {
@@ -356,7 +356,7 @@ pub fn run(config_file: Option<&str>, debug: bool, version: &str) -> Result<(), 
         ));
     }
     if cfg.name.is_empty() && cfg.server_id.is_empty() {
-        cfg.name = crate::command::get_system_hostname();
+        cfg.name = crate::util::command::get_system_hostname();
     }
     normalize_config_intervals(&mut cfg);
 
@@ -603,7 +603,7 @@ impl Agent {
                 || now.duration_since(full_at_guard.unwrap()) >= report_interval);
 
         if full_due {
-            if crate::log::maybe_rotate_log_file(&self.paths.log_file, crate::log::DEFAULT_MAX_LOG_SIZE) {
+            if crate::util::log::maybe_rotate_log_file(&self.paths.log_file, crate::util::log::DEFAULT_MAX_LOG_SIZE) {
                 self.log.info(&format!("log file exceeded size limit, rotated to {}.1", self.paths.log_file));
             }
             let stats = collect_basic_stats();
@@ -883,7 +883,7 @@ impl Agent {
             let server_name = if !cfg.name.trim().is_empty() {
                 cfg.name.trim().to_string()
             } else {
-                crate::command::get_system_hostname()
+                crate::util::command::get_system_hostname()
             };
             map.insert("name".to_string(), serde_json::Value::String(server_name));
         }

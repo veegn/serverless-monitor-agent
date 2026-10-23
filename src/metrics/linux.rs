@@ -133,7 +133,7 @@ pub fn collect_basic_stats() -> BasicStats {
         boot_time_ms: linux_boot_time_ms(),
         os_name: linux_os_name(),
         arch: native_arch().to_string(),
-        kernel: crate::command::command_output("uname", &["-r"]),
+        kernel: crate::util::command::command_output("uname", &["-r"]),
         cpu_info: linux_cpu_info(),
         cpu_cores: num_cpus(),
         gpu_info: detect_gpu_info(),
@@ -348,7 +348,7 @@ pub fn linux_conn_count(name: &str) -> usize {
 }
 
 pub fn read_net_bytes(ifaces: &str) -> Result<NetBytes, String> {
-    let wanted: HashSet<String> = crate::config::split_interface_set(ifaces);
+    let wanted: HashSet<String> = crate::storage::config::split_interface_set(ifaces);
     let file = fs::File::open("/proc/net/dev").map_err(|e| e.to_string())?;
     let reader = BufReader::new(file);
 

@@ -125,6 +125,6 @@ fn test_parse_install_options_token_alias() {
 
 #[test]
 fn test_get_system_hostname_non_empty() {
-    let host = serverless_monitor_agent::command::get_system_hostname();
+    let host = serverless_monitor_agent::util::command::get_system_hostname();
     assert!(!host.is_empty(), "hostname should not be empty");
 }

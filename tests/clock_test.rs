@@ -1,4 +1,4 @@
-use serverless_monitor_agent::clock::{
+use serverless_monitor_agent::util::clock::{
     parse_http_date, CalibratedClock, ClockCalibration,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};

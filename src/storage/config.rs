@@ -1,4 +1,4 @@
-use crate::traffic::parse_kv_file;
+use crate::storage::traffic::parse_kv_file;
 use crate::types::*;
 use regex::Regex;
 use std::collections::HashSet;
@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 static IFACE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_.:\-\*\?\[\]]+$").unwrap());
 
-pub use crate::dns::use_public_dns_resolver;
+pub use crate::net::dns::use_public_dns_resolver;
 
 pub fn default_config() -> Config {
     Config::default()
