@@ -1,16 +1,38 @@
-use crate::net::dns::use_public_dns_resolver;
-use crate::util::log::Logger;
-use crate::types::*;
-use crate::net::websocket::{dial_websocket, WebSocketConn, WsError, WS_OPCODE_TEXT};
-use serde::{Deserialize, Serialize};
+//! WebSocket transport module for telemetry reports and remote configuration.
+//!
+//! Submodules:
+//! - [`frames`]: Protocol frame types and config payload unpacking
+//! - [`schedule`]: Schedule inactivation checks and backoff delays
+//! - [`url`]: WebSocket URL transformations
+
+pub mod frames;
+pub mod schedule;
+pub mod url;
+
+pub use frames::{
+    wss_config_body_and_headers, wss_config_payload, wss_string_from_value, WsHelloFrame,
+    WsServerFrame,
+};
+pub use schedule::{
+    is_auth_config_http_status, is_wss_schedule_inactive_reason, next_wss_backoff,
+    wss_schedule_inactive_from_frame, wss_schedule_inactive_from_handshake,
+    wss_schedule_inactive_from_headers, AGENT_WSS_MODE_ACTIVE, AGENT_WSS_MODE_DISABLED,
+    AGENT_WSS_MODE_HEADER, AGENT_WSS_MODE_INACTIVE, AGENT_WSS_REASON_HEADER,
+    AGENT_WSS_SCHEDULE_DISABLED, AGENT_WSS_SCHEDULE_EMPTY, AGENT_WSS_SCHEDULE_INACTIVE,
+    WSS_NETWORK_MAX_RETRY, WSS_NETWORK_MIN_RETRY, WSS_PROTOCOL_RETRY_DELAY,
+};
+pub use url::{report_websocket_url, report_websocket_url_with_config};
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-pub const WSS_PROTOCOL_RETRY_DELAY: Duration = Duration::from_secs(120);
-pub const WSS_NETWORK_MIN_RETRY: Duration = Duration::from_secs(60);
-pub const WSS_NETWORK_MAX_RETRY: Duration = Duration::from_secs(300);
+use crate::net::dns::use_public_dns_resolver;
+use crate::net::websocket::{dial_websocket, WebSocketConn, WsError, WS_OPCODE_TEXT};
+use crate::types::{Config, CONFIG_SCHEMA_VERSION, DEFAULT_WSS_REPORT_INTERVAL_SEC};
+use crate::util::log::Logger;
+
 pub const WSS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const WSS_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 pub const WSS_WRITE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -19,99 +41,6 @@ pub const WSS_READ_IDLE_MIN: Duration = Duration::from_secs(15);
 pub const WSS_CONFIG_MIN_INTERVAL: Duration = Duration::from_secs(60);
 pub const WSS_DYNAMIC_MIN_INTERVAL: Duration = Duration::from_secs(1);
 pub const WSS_DYNAMIC_MAX_INTERVAL: Duration = Duration::from_secs(300);
-
-pub const AGENT_WSS_MODE_HEADER: &str = "x-agent-wss-mode";
-pub const AGENT_WSS_REASON_HEADER: &str = "x-agent-wss-reason";
-pub const AGENT_WSS_MODE_ACTIVE: &str = "active";
-pub const AGENT_WSS_MODE_INACTIVE: &str = "inactive";
-pub const AGENT_WSS_MODE_DISABLED: &str = "disabled";
-pub const AGENT_WSS_SCHEDULE_INACTIVE: &str = "wss_schedule_inactive";
-pub const AGENT_WSS_SCHEDULE_EMPTY: &str = "wss_schedule_empty";
-pub const AGENT_WSS_SCHEDULE_DISABLED: &str = "wss_disabled";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WsHelloFrame {
-    #[serde(default)]
-    pub r#type: String,
-    #[serde(default)]
-    pub ts: i64,
-    #[serde(default)]
-    pub protocol: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct WsServerFrame {
-    #[serde(default)]
-    pub r#type: String,
-    #[serde(default)]
-    pub ts: i64,
-    #[serde(default)]
-    pub persisted: Option<bool>,
-    #[serde(default, rename = "nextD1WriteAfterMs")]
-    pub next_d1_write_after_ms: Option<i64>,
-    #[serde(default, rename = "nextWssReportAfterMs")]
-    pub next_wss_report_after_ms: Option<i64>,
-    #[serde(default, rename = "realtimeHint")]
-    pub realtime_hint: bool,
-    #[serde(default)]
-    pub error: String,
-    #[serde(default)]
-    pub code: i32,
-    #[serde(default)]
-    pub text: String,
-    #[serde(default)]
-    pub connection_mode: String,
-    #[serde(default)]
-    pub body: String,
-    #[serde(default)]
-    pub config_body: String,
-    #[serde(default)]
-    pub config: Option<serde_json::Value>,
-    #[serde(default)]
-    pub config_md5: String,
-    #[serde(default, rename = "configMd5")]
-    pub config_md5_camel: String,
-    #[serde(default)]
-    pub md5: String,
-    #[serde(default)]
-    pub payload: Option<serde_json::Value>,
-    #[serde(default)]
-    pub headers: Option<serde_json::Value>,
-}
-
-pub fn report_websocket_url(raw: &str) -> Result<String, String> {
-    let mut u = url::Url::parse(raw.trim()).map_err(|e| e.to_string())?;
-    let host = u.host_str().ok_or_else(|| format!("missing host in {:?}", raw))?;
-    if host.is_empty() {
-        return Err(format!("missing host in {:?}", raw));
-    }
-    match u.scheme().to_ascii_lowercase().as_str() {
-        "https" => {
-            u.set_scheme("wss").map_err(|_| "failed to set wss scheme")?;
-        }
-        "http" => {
-            u.set_scheme("ws").map_err(|_| "failed to set ws scheme")?;
-        }
-        "wss" | "ws" => {}
-        other => return Err(format!("unsupported scheme {:?}", other)),
-    }
-    Ok(u.to_string())
-}
-
-pub fn report_websocket_url_with_config(raw: &str, schema: &str, md5: &str) -> Result<String, String> {
-    let ws_url = report_websocket_url(raw)?;
-    let mut u = url::Url::parse(&ws_url).map_err(|e| e.to_string())?;
-    {
-        let mut pairs = u.query_pairs_mut();
-        if !schema.trim().is_empty() {
-            pairs.append_pair("config_schema", schema.trim());
-        }
-        if !md5.trim().is_empty() {
-            pairs.append_pair("config_md5", md5.trim());
-        }
-    }
-    Ok(u.to_string())
-}
 
 pub trait TransportHost: Send + Sync {
     fn logger(&self) -> Logger;
@@ -729,210 +658,5 @@ impl Clone for ReportTransport {
             wake_cv: self.wake_cv.clone(),
             shutdown: self.shutdown.clone(),
         }
-    }
-}
-
-pub fn is_auth_config_http_status(status_code: i32) -> bool {
-    status_code == 401 || status_code == 403 || status_code == 404
-}
-
-pub fn is_wss_schedule_inactive_reason(reason: &str) -> bool {
-    let r = reason.trim().to_ascii_lowercase();
-    r == AGENT_WSS_SCHEDULE_INACTIVE || r == AGENT_WSS_SCHEDULE_EMPTY || r == AGENT_WSS_SCHEDULE_DISABLED
-}
-
-pub fn wss_schedule_inactive_from_handshake(
-    status_code: u16,
-    headers: &HashMap<String, String>,
-    body: &str,
-) -> Option<String> {
-    if status_code != 409 {
-        return None;
-    }
-    if let Some(reason) = wss_schedule_inactive_from_headers(headers) {
-        return Some(reason);
-    }
-    let b = body.trim().to_ascii_lowercase();
-    if is_wss_schedule_inactive_reason(&b) {
-        return Some(b);
-    }
-    None
-}
-
-pub fn wss_schedule_inactive_from_headers(headers: &HashMap<String, String>) -> Option<String> {
-    let mode = headers.get(AGENT_WSS_MODE_HEADER).map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
-    if !mode.is_empty() && mode != AGENT_WSS_MODE_INACTIVE && mode != AGENT_WSS_MODE_DISABLED {
-        return None;
-    }
-    let reason = headers.get(AGENT_WSS_REASON_HEADER).map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
-    if is_wss_schedule_inactive_reason(&reason) {
-        Some(reason)
-    } else {
-        None
-    }
-}
-
-pub fn wss_schedule_inactive_from_frame(frame: &WsServerFrame) -> Option<String> {
-    if frame.code != 409 {
-        return None;
-    }
-    let reason = if !frame.text.is_empty() {
-        &frame.text
-    } else {
-        &frame.error
-    };
-    if is_wss_schedule_inactive_reason(reason) {
-        Some(reason.to_string())
-    } else {
-        None
-    }
-}
-
-pub fn next_wss_backoff(current: Duration) -> Duration {
-    if current < WSS_NETWORK_MIN_RETRY {
-        return WSS_NETWORK_MIN_RETRY;
-    }
-    let next = current * 2;
-    if next > WSS_NETWORK_MAX_RETRY {
-        WSS_NETWORK_MAX_RETRY
-    } else {
-        next
-    }
-}
-
-pub fn wss_config_body_and_headers(
-    frame: &WsServerFrame,
-) -> Option<(Vec<u8>, HashMap<String, String>)> {
-    let mut body = if !frame.body.is_empty() {
-        frame.body.clone()
-    } else if !frame.config_body.is_empty() {
-        frame.config_body.clone()
-    } else if let Some(v) = &frame.config {
-        wss_string_from_value(v)
-    } else {
-        String::new()
-    };
-
-    let mut md5 = if !frame.config_md5.is_empty() {
-        frame.config_md5.clone()
-    } else if !frame.config_md5_camel.is_empty() {
-        frame.config_md5_camel.clone()
-    } else {
-        frame.md5.clone()
-    };
-
-    let mut headers = HashMap::new();
-    if let Some(h) = &frame.headers {
-        if let Some(map) = h.as_object() {
-            for (k, v) in map {
-                if let Some(s) = v.as_str() {
-                    headers.insert(k.clone(), s.to_string());
-                }
-            }
-            if let Some(h_md5) = headers.get("X-Agent-Config-Md5").or_else(|| headers.get("x-agent-config-md5")) {
-                if md5.is_empty() {
-                    md5 = h_md5.clone();
-                }
-            }
-        }
-    }
-
-    if body.is_empty() {
-        if let Some(p) = &frame.payload {
-            let (p_body, p_md5, p_headers) = wss_config_payload(p);
-            if !p_body.is_empty() {
-                body = p_body;
-                if md5.is_empty() {
-                    md5 = p_md5;
-                }
-                for (k, v) in p_headers {
-                    headers.insert(k, v);
-                }
-            }
-        }
-    }
-
-    if body.is_empty() {
-        if let Some(c) = &frame.config {
-            let (c_body, c_md5, c_headers) = wss_config_payload(c);
-            if !c_body.is_empty() {
-                body = c_body;
-                if md5.is_empty() {
-                    md5 = c_md5;
-                }
-                for (k, v) in c_headers {
-                    headers.insert(k, v);
-                }
-            }
-        }
-    }
-
-    if !md5.is_empty() {
-        headers.insert("X-Agent-Config-Md5".to_string(), md5);
-    }
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some((trimmed.as_bytes().to_vec(), headers))
-    }
-}
-
-pub fn wss_config_payload(payload: &serde_json::Value) -> (String, String, HashMap<String, String>) {
-    match payload {
-        serde_json::Value::String(s) => (s.trim().to_string(), String::new(), HashMap::new()),
-        serde_json::Value::Object(map) => {
-            let mut headers = HashMap::new();
-            if let Some(h) = map.get("headers").and_then(|v| v.as_object()) {
-                for (k, v) in h {
-                    if let Some(s) = v.as_str() {
-                        headers.insert(k.clone(), s.to_string());
-                    }
-                }
-            }
-            let body = map
-                .get("body")
-                .and_then(|v| v.as_str())
-                .or_else(|| map.get("config").and_then(|v| v.as_str()))
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let md5 = map
-                .get("config_md5")
-                .or_else(|| map.get("configMd5"))
-                .or_else(|| map.get("md5"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-
-            if !body.is_empty() {
-                return (body, md5, headers);
-            }
-
-            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-            let keys = [
-                "collect_interval", "report_interval", "wss_report_interval", "reset_day", "schema_version",
-                "interface", "connection_mode", "ping_mode", "custom_ct", "custom_cu", "custom_cm",
-                "custom_bd", "node_1", "node_2", "node_3", "node_4", "rx_correction", "tx_correction", "update",
-            ];
-            for key in keys {
-                if let Some(val) = map.get(key) {
-                    let s = wss_string_from_value(val);
-                    serializer.append_pair(key, &s);
-                }
-            }
-            (serializer.finish(), md5, headers)
-        }
-        _ => (String::new(), String::new(), HashMap::new()),
-    }
-}
-
-pub fn wss_string_from_value(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => s.trim().to_string(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::Bool(b) => if *b { "1".to_string() } else { "0".to_string() },
-        _ => String::new(),
     }
 }
