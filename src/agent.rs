@@ -48,8 +48,10 @@ pub const REPORT_FAILURE_THRESHOLD: usize = 3;
 pub const REPORT_BACKOFF_MAX: Duration = Duration::from_secs(600);
 pub const REPORT_FAILURE_DECAY: Duration = Duration::from_secs(1800);
 
-pub const AGENT_AUTO_DISCOVERY_HEADER: &str = "x-cfsm-auto-discovery";
-pub const AGENT_AUTO_DISCOVERY_SERVER_ID_KEY: &str = "x-cfsm-server-id";
+pub const AGENT_AUTO_DISCOVERY_HEADER: &str = "x-sma-auto-discovery";
+pub const AGENT_AUTO_DISCOVERY_SERVER_ID_KEY: &str = "x-sma-server-id";
+pub const LEGACY_AGENT_AUTO_DISCOVERY_HEADER: &str = "x-cfsm-auto-discovery";
+pub const LEGACY_AGENT_AUTO_DISCOVERY_SERVER_ID_KEY: &str = "x-cfsm-server-id";
 pub const AGENT_AUTO_DISCOVERY_CREATED: &str = "created";
 pub const AGENT_AUTO_DISCOVERY_REUSED: &str = "reused";
 pub const AGENT_AUTO_DISCOVERY_FAILED: &str = "failed";
@@ -1065,7 +1067,11 @@ impl Agent {
         self.apply_auto_discovery_headers(headers);
 
         if status_code == 404
-            && headers.get(AGENT_AUTO_DISCOVERY_HEADER).map(|s| s.trim()).unwrap_or("").is_empty()
+            && headers.get(AGENT_AUTO_DISCOVERY_HEADER)
+                .or_else(|| headers.get(LEGACY_AGENT_AUTO_DISCOVERY_HEADER))
+                .map(|s| s.trim())
+                .unwrap_or("")
+                .is_empty()
             && self.config_snapshot().server_id.is_empty()
         {
             self.abort_auto_discovery(AGENT_AUTO_DISCOVERY_DISABLED, "");
@@ -1144,7 +1150,9 @@ impl Agent {
     }
 
     fn apply_auto_discovery_headers(&self, headers: &HashMap<String, String>) {
-        let raw = match headers.get(AGENT_AUTO_DISCOVERY_HEADER) {
+        let raw = match headers.get(AGENT_AUTO_DISCOVERY_HEADER)
+            .or_else(|| headers.get(LEGACY_AGENT_AUTO_DISCOVERY_HEADER))
+        {
             Some(s) => s.trim().to_ascii_lowercase(),
             None => return,
         };
@@ -1160,6 +1168,7 @@ impl Agent {
             AGENT_AUTO_DISCOVERY_CREATED => {
                 let server_id = headers
                     .get(AGENT_AUTO_DISCOVERY_SERVER_ID_KEY)
+                    .or_else(|| headers.get(LEGACY_AGENT_AUTO_DISCOVERY_SERVER_ID_KEY))
                     .map(|s| s.trim())
                     .unwrap_or("");
                 if server_id.is_empty() {

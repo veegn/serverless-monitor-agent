@@ -14,7 +14,10 @@ $Repo = "veegn/serverless-monitor-agent"
 $GitHubProxy = ""
 $InstallVersion = "latest"
 
+$payloadArgs = @()
 $needValueFor = ""
+$command = ""
+
 foreach ($arg in $args) {
     if ($needValueFor) {
         switch ($needValueFor) {
@@ -29,6 +32,30 @@ foreach ($arg in $args) {
         "^--install-ghproxy$" { $needValueFor = "proxy"; continue }
         "^--install-version=(.+)$" { $InstallVersion = $Matches[1]; continue }
         "^--install-version$" { $needValueFor = "version"; continue }
+        default {
+            if (-not $command -and -not $arg.StartsWith("-")) {
+                $command = $arg
+            }
+            $payloadArgs += $arg
+        }
+    }
+}
+
+if (-not $command) {
+    $command = "install"
+}
+
+if ($command -in @("uninstall", "remove", "delete", "purge")) {
+    Write-Host "[INFO] downloading temporary uninstaller"
+    $payloadArgs = @($command)
+} elseif ($payloadArgs.Count -eq 0) {
+    $payloadArgs = @("install")
+}
+
+if ($GitHubProxy -and $command -eq "install") {
+    $hasProxyFlag = $payloadArgs | Where-Object { $_ -match "^-install[-_]ghproxy=" }
+    if (-not $hasProxyFlag) {
+        $payloadArgs += "-install-ghproxy=$GitHubProxy"
     }
 }
 
@@ -48,6 +75,7 @@ function Get-ArchName {
         # 0=x86 1=MIPS 2=Alpha 6=IA64 9=x64 12=ARM64
         if ($cpu.DeviceArchitecture -eq 12) { "arm64"; return }
         if ($cpu.DeviceArchitecture -eq 9) { "amd64"; return }
+        if ($cpu.DeviceArchitecture -eq 0) { "386"; return }
     } catch {
         # Fall through to the environment variable below.
     }
@@ -55,15 +83,8 @@ function Get-ArchName {
         "AMD64" { "amd64"; break }
         "ARM64" { "arm64"; break }
         "x86" { "386"; break }
-        default { throw "unsupported architecture: $env:PROCESSOR_ARCHITECTURE" }
+        default { throw "unsupported architecture for Windows: $env:PROCESSOR_ARCHITECTURE (supported: amd64, arm64, 386)" }
     }
-}
-
-$command = if ($args.Count -gt 0) { $args[0] } else { "install" }
-$payloadArgs = @($args)
-if ($command -in @("uninstall", "remove", "delete", "purge")) {
-    Write-Host "[INFO] downloading temporary uninstaller"
-    $payloadArgs = @($command)
 }
 
 $arch = Get-ArchName
@@ -84,11 +105,7 @@ Write-Host "  url     : $url"
 
 try {
     Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
-    if ($args.Count -eq 0) {
-        & $tmp install
-    } else {
-        & $tmp @payloadArgs
-    }
+    & $tmp @payloadArgs
     exit $LASTEXITCODE
 } finally {
     Remove-Item $tmp -Force -ErrorAction SilentlyContinue

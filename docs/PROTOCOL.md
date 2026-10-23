@@ -63,8 +63,8 @@
 | 响应头 | 示例值 | 说明 |
 | :--- | :--- | :--- |
 | `Date` | `Thu, 23 Oct 2026 11:00:00 GMT` | HTTP 标准时间，供 Agent 动态校准单机时钟漂移 |
-| `x-cfsm-auto-discovery` | `created` / `reused` / `failed` / `disabled` | 服务发现建号状态标记 |
-| `x-cfsm-server-id` | `srv-us-east-01` | 服务端自动建号分配的服务器 ID |
+| `x-sma-auto-discovery` | `created` / `reused` / `failed` / `disabled` | 服务发现建号状态标记 |
+| `x-sma-server-id` | `srv-us-east-01` | 服务端自动建号分配的服务器 ID |
 | `x-agent-wss-mode` | `active` / `inactive` / `disabled` | 服务端下发的 WSS 连接调度指令 |
 | `x-agent-wss-reason` | `wss_schedule_inactive` | WSS 调度变更原因 |
 
@@ -86,16 +86,16 @@ sequenceDiagram
     Agent->>Server: HTTP POST /update (带 Token、name 与完整 VPS 画像)
     Note over Server: 校验授权 Token<br/>检查节点唯一性并分配 server_id
     alt 注册成功
-        Server-->>Agent: 200 OK<br/>x-cfsm-auto-discovery: created<br/>x-cfsm-server-id: {NEW_SERVER_ID}
+        Server-->>Agent: 200 OK<br/>x-sma-auto-discovery: created<br/>x-sma-server-id: {NEW_SERVER_ID}
         Note over Agent: 保存 server_id 到 config.conf<br/>转入正常监控周期
     else Token 无效 / 权限不足
         Server-->>Agent: 401 Unauthorized / 403 Forbidden
         Note over Agent: 输出明确鉴权失败日志，退出并提示检查 Token
     else 同名节点冲突且禁止覆盖
-        Server-->>Agent: 200 OK<br/>x-cfsm-auto-discovery: reused
+        Server-->>Agent: 200 OK<br/>x-sma-auto-discovery: reused
         Note over Agent: 提示节点名称重复，安全中止退出
     else 服务端未开启服务发现
-        Server-->>Agent: 404 Not Found<br/>x-cfsm-auto-discovery: disabled
+        Server-->>Agent: 404 Not Found<br/>x-sma-auto-discovery: disabled
         Note over Agent: 提示在服务端开启自动发现功能
     end
 ```
@@ -371,8 +371,8 @@ WSS URL 附带版本与配置校验参数：
 
 | HTTP 状态码 | 自定义标头 / 错误提示 | 客户端处置行为 |
 | :--- | :--- | :--- |
-| `200 OK` | `x-cfsm-auto-discovery: created` | 建号成功，提取 `x-cfsm-server-id` 写入配置，重置退避计数器 |
-| `200 OK` | `x-cfsm-auto-discovery: reused` | 节点同名冲突，Agent 安全终止退出，不无限重启 |
+| `200 OK` | `x-sma-auto-discovery: created` | 建号成功，提取 `x-sma-server-id` 写入配置，重置退避计数器 |
+| `200 OK` | `x-sma-auto-discovery: reused` | 节点同名冲突，Agent 安全终止退出，不无限重启 |
 | `401 Unauthorized` | 无效 Token | 鉴权失败，记录 ERROR 日志，终止建号 |
 | `404 Not Found` | 未开启自动发现（空 ID 请求） | 提示服务端开启「自动发现」，退出运行 |
 | `429 / 5xx / 网络超时` | 触发指数退避 | 暂停网络请求，将采样写入本地 `metrics_cache.dat`，等待恢复后批量补报 |

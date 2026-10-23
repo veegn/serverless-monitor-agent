@@ -247,6 +247,9 @@ pub fn find_release_asset<'a>(
 }
 
 pub fn expected_update_asset_name(goos: &str, goarch: &str) -> String {
+    if goos == "linux" && (goarch == "arm" || goarch == "armv7") {
+        return "sma-linux-armv7".to_string();
+    }
     let goarm = "";
     update_asset_name_for_arm(goos, goarch, goarm)
 }

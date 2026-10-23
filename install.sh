@@ -14,23 +14,58 @@ die() {
     exit 1
 }
 
-need_value_for=""
-for arg in "$@"; do
-    if [ -n "$need_value_for" ]; then
-        case "$need_value_for" in
+cmd=""
+need_val=""
+orig_count=$#
+
+while [ $orig_count -gt 0 ]; do
+    arg="$1"
+    shift
+    orig_count=$((orig_count - 1))
+    if [ -n "$need_val" ]; then
+        case "$need_val" in
             proxy) GITHUB_PROXY="$arg" ;;
             version) INSTALL_VERSION="$arg" ;;
         esac
-        need_value_for=""
+        need_val=""
         continue
     fi
     case "$arg" in
-        --install-ghproxy=*) GITHUB_PROXY="${arg#*=}" ;;
-        --install-ghproxy) need_value_for="proxy" ;;
-        --install-version=*) INSTALL_VERSION="${arg#*=}" ;;
-        --install-version) need_value_for="version" ;;
+        --install-ghproxy=*)
+            GITHUB_PROXY="${arg#*=}"
+            ;;
+        --install-ghproxy)
+            need_val="proxy"
+            ;;
+        --install-version=*)
+            INSTALL_VERSION="${arg#*=}"
+            ;;
+        --install-version)
+            need_val="version"
+            ;;
+        *)
+            if [ -z "$cmd" ] && [ "${arg#-}" = "$arg" ]; then
+                cmd="$arg"
+            fi
+            set -- "$@" "$arg"
+            ;;
     esac
 done
+
+cmd="${cmd:-install}"
+
+# If --install-ghproxy was passed for bootstrap, pass -install-ghproxy to sma install
+if [ -n "$GITHUB_PROXY" ] && [ "$cmd" = "install" ]; then
+    has_proxy_arg=0
+    for a in "$@"; do
+        case "$a" in
+            -install-ghproxy=*|-install_ghproxy=*) has_proxy_arg=1 ;;
+        esac
+    done
+    if [ "$has_proxy_arg" -eq 0 ]; then
+        set -- "$@" "-install-ghproxy=$GITHUB_PROXY"
+    fi
+fi
 
 detect_os() {
     os="$(uname -s 2>/dev/null || printf unknown)"
@@ -43,11 +78,6 @@ detect_os() {
     esac
 }
 
-# Binaries built with Go 1.27+ record LC_BUILD_VERSION minos=13.0, so dyld
-# refuses to load them on macOS 12 and older. Catch that before downloading,
-# otherwise the failure surfaces as the misleading "could not be executed"
-# message below. Uninstall only warns: blocking it would leave old systems
-# with no script-driven way to remove the agent.
 check_darwin_version() {
     ver="$(sw_vers -productVersion 2>/dev/null || true)"
     [ -n "$ver" ] || return 0
@@ -55,65 +85,57 @@ check_darwin_version() {
     case "$major" in
         ''|*[!0-9]*) return 0 ;;
     esac
-    if [ "$major" -ge 13 ]; then
+    if [ "$major" -ge 11 ]; then
         return 0
     fi
-    case "${cmd:-install}" in
+    case "$cmd" in
         uninstall|remove|delete|purge)
-            log "[WARN] macOS $ver is older than the supported minimum macOS 13 Ventura."
+            log "[WARN] macOS $ver is older than the supported minimum macOS 11 Big Sur."
             log "[WARN] the temporary uninstaller may not run; if it fails, run the installed 'sma uninstall' directly."
             return 0
             ;;
     esac
-    die "macOS $ver is not supported: this release requires macOS 13 Ventura or later. Please install v1.0.20 or earlier."
-}
-
-# MIPS uname -m does NOT reveal byte order: modern kernels report "mips" for both
-# big-endian (ath79/ar71xx) and little-endian (ramips MT762x) routers, so mapping
-# uname -m directly to an asset hands little-endian devices the big-endian binary,
-# which the kernel refuses to exec and BusyBox sh then mis-parses as a script
-# ("syntax error: unexpected (""). We read the e_ident[EI_DATA] byte (offset 5;
-# 1=LSB/little, 2=MSB/big) of a native ELF to tell them apart. The device's own
-# shell is probed, never the freshly downloaded bootstrap binary, which may itself
-# be the wrong endianness. Falls back to little-endian (the common OpenWrt case).
-detect_mips_endian() {
-    probe=""
-    for cand in /bin/sh /bin/busybox "$(command -v sh 2>/dev/null || true)" "$(command -v od 2>/dev/null || true)" /usr/bin/env; do
-        if [ -n "$cand" ] && [ -f "$cand" ]; then
-            probe="$cand"
-            break
-        fi
-    done
-    if [ -z "$probe" ]; then
-        printf le
-        return
-    fi
-    case "$(od -An -tu1 -j5 -N1 "$probe" 2>/dev/null | tr -d ' \t\n')" in
-        2) printf be ;;
-        1) printf le ;;
-        *) printf le ;;
-    esac
+    die "macOS $ver is not supported: this release requires macOS 11 Big Sur or later."
 }
 
 detect_arch() {
     arch="$(uname -m 2>/dev/null || printf unknown)"
-    case "$arch" in
-        x86_64|amd64) printf amd64 ;;
-        aarch64|arm64) printf arm64 ;;
-        i386|i686) printf 386 ;;
-        armv5*) if [ "${os_name:-}" = "freebsd" ]; then printf arm; else printf armv5; fi ;;
-        armv6*) if [ "${os_name:-}" = "freebsd" ]; then printf arm; else printf armv6; fi ;;
-        armv7*|armv8l) if [ "${os_name:-}" = "freebsd" ]; then printf arm; else printf armv7; fi ;;
-        # MIPS assets are built with GOMIPS=softfloat so they also run on router
-        # CPUs without an FPU; the asset name matches GOARCH, which is what the
-        # in-agent auto updater looks for. Endianness comes from detect_mips_endian,
-        # not from uname -m, because uname -m cannot distinguish it.
-        mips|mipsel|mipsle|lmips)
-            if [ "$(detect_mips_endian)" = be ]; then printf mips; else printf mipsle; fi ;;
-        mips64|mips64el|mips64le|lmips64)
-            if [ "$(detect_mips_endian)" = be ]; then printf mips64; else printf mips64le; fi ;;
-        loongarch64|loong64) printf loong64 ;;
-        *) die "unsupported architecture: $arch" ;;
+    case "$os_name" in
+        darwin)
+            case "$arch" in
+                x86_64|amd64) printf amd64 ;;
+                aarch64|arm64) printf arm64 ;;
+                *) die "unsupported architecture for macOS: $arch (supported: amd64, arm64)" ;;
+            esac
+            ;;
+        freebsd)
+            case "$arch" in
+                x86_64|amd64) printf amd64 ;;
+                *) die "unsupported architecture for FreeBSD: $arch (supported: amd64)" ;;
+            esac
+            ;;
+        windows)
+            case "$arch" in
+                x86_64|amd64) printf amd64 ;;
+                aarch64|arm64) printf arm64 ;;
+                i386|i686) printf 386 ;;
+                *) die "unsupported architecture for Windows: $arch (supported: amd64, arm64, 386)" ;;
+            esac
+            ;;
+        linux)
+            case "$arch" in
+                x86_64|amd64) printf amd64 ;;
+                aarch64|arm64) printf arm64 ;;
+                i386|i686) printf 386 ;;
+                armv7*|armv8l|armhf) printf armv7 ;;
+                armv5*|armv6*) die "ARM architecture '$arch' is not supported (pre-compiled binaries require ARMv7 or ARM64)" ;;
+                mips*|loong*) die "architecture '$arch' is not supported by pre-compiled binaries" ;;
+                *) die "unsupported architecture for Linux: $arch (supported: amd64, arm64, 386, armv7)" ;;
+            esac
+            ;;
+        *)
+            die "unsupported OS: $os_name"
+            ;;
     esac
 }
 
@@ -194,7 +216,6 @@ stage_and_run_payload() {
     return "$rc"
 }
 
-cmd="${1:-install}"
 case "$cmd" in
     uninstall|remove|delete|purge)
         log "[INFO] downloading temporary uninstaller"
