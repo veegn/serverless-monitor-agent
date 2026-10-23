@@ -117,7 +117,7 @@ pub fn http_ping(target: &str, timeout: Duration) -> Result<i32, String> {
     let _addr = SocketAddr::new(ip, port);
 
     let start = Instant::now();
-    let resp = crate::net::http::get(&parsed.to_string(), &[("User-Agent", "cfsm")], timeout, false)?;
+    let resp = crate::net::http::get(parsed.as_ref(), &[("User-Agent", "cfsm")], timeout, false)?;
     let mut ms = start.elapsed().as_millis() as i32;
     if ms < 1 {
         ms = 1;

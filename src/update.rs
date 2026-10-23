@@ -427,7 +427,7 @@ pub fn schedule_unix_update_install(
             quote_shell(log_file)
         );
     }
-    let res = Command::new("sh").args(&["-c", &nohup_cmd]).status().map_err(|e| e.to_string())?;
+    let res = Command::new("sh").args(["-c", &nohup_cmd]).status().map_err(|e| e.to_string())?;
     if res.success() {
         Ok("nohup".to_string())
     } else {
@@ -444,7 +444,7 @@ pub fn schedule_windows_update_install(paths: &Paths, bin_path: &str) -> Result<
         crate::platform::quote_powershell_literal(bin_path)
     );
     let child = Command::new("powershell")
-        .args(&["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
         .spawn()
         .map_err(|e| e.to_string())?;
     drop(child);
@@ -537,7 +537,7 @@ WantedBy=multi-user.target
     fs::write(&service_file, content.as_bytes()).map_err(|e| e.to_string())?;
     let _ = run_command_quiet("systemctl", &["daemon-reload"]);
     let status = Command::new("systemctl")
-        .args(&["start", &format!("{}.service", unit)])
+        .args(["start", &format!("{}.service", unit)])
         .output()
         .map_err(|e| e.to_string())?;
     if status.status.success() {

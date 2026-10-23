@@ -132,6 +132,7 @@ pub fn create_tls_config() -> Arc<ClientConfig> {
     TLS_CONFIG.clone()
 }
 
+#[allow(clippy::large_enum_variant)]
 enum HttpStream {
     Plain(TcpStream),
     Tls(StreamOwned<ClientConnection, TcpStream>),
@@ -268,7 +269,7 @@ fn do_single_http_request(
     let mut status_line = String::new();
     reader.read_line(&mut status_line).map_err(|e| e.to_string())?;
 
-    let parts: Vec<&str> = status_line.trim().split_whitespace().collect();
+    let parts: Vec<&str> = status_line.split_whitespace().collect();
     if parts.len() < 2 {
         return Err(format!("invalid HTTP status line: {:?}", status_line));
     }

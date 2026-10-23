@@ -47,11 +47,11 @@ impl Agent {
         let rep = self.reporter.lock().unwrap().clone();
         if let Some(r) = rep {
             if self.uses_wss_config(cfg) {
-                let fallback = Duration::from_secs(DEFAULT_WSS_REPORT_INTERVAL_SEC as u64);
+                let fallback = Duration::from_secs(DEFAULT_WSS_REPORT_INTERVAL_SEC);
                 return r.report_interval(fallback);
             }
         }
-        Duration::from_secs(DEFAULT_WSS_REPORT_INTERVAL_SEC as u64)
+        Duration::from_secs(DEFAULT_WSS_REPORT_INTERVAL_SEC)
     }
 
     pub(super) fn persistent_uses_wss_config(&self, _cfg: &Config) -> bool {
@@ -122,7 +122,7 @@ impl Agent {
         let sample_interval = if collect_interval > Duration::ZERO {
             collect_interval
         } else if !wss_connected && !auto_discovery_due {
-            Duration::from_secs(DEFAULT_WSS_REPORT_INTERVAL_SEC as u64)
+            Duration::from_secs(DEFAULT_WSS_REPORT_INTERVAL_SEC)
         } else {
             Duration::ZERO
         };
@@ -137,7 +137,7 @@ impl Agent {
         let report_due = should_wss_report || auto_discovery_due;
         let mut report_interval = Duration::from_secs(cfg.report_interval);
         if report_interval < Duration::from_secs(1) {
-            report_interval = Duration::from_secs(DEFAULT_REPORT_INTERVAL_SEC as u64);
+            report_interval = Duration::from_secs(DEFAULT_REPORT_INTERVAL_SEC);
         }
 
         let mut full_at_guard = self.full_at.lock().unwrap();
@@ -188,7 +188,7 @@ impl Agent {
 
         let rx_monthly = *self.monthly_rx.lock().unwrap();
         let tx_monthly = *self.monthly_tx.lock().unwrap();
-        let disk_io = self.disk_io.lock().unwrap().clone();
+        let disk_io = *self.disk_io.lock().unwrap();
 
         let m = self.build_metrics(&cfg, &cpu, net_now, rx_speed, tx_speed, rx_monthly, tx_monthly, disk_io);
 

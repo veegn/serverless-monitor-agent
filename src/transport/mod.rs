@@ -411,29 +411,24 @@ impl ReportTransport {
                 )));
             }
 
-            let msg_res;
-            {
+            let msg_res = {
                 let mut guard = self.conn.lock().unwrap();
-                if let Some(conn) = guard.as_mut() {
-                    let _ = conn.set_read_timeout(Some(short_poll));
-                    msg_res = Some(conn.read_data_message());
-                } else {
-                    return None;
-                }
-            }
+                let conn = guard.as_mut()?;
+                let _ = conn.set_read_timeout(Some(short_poll));
+                conn.read_data_message()
+            };
             let (payload, opcode) = match msg_res {
-                Some(Ok(res)) => {
+                Ok(res) => {
                     last_activity = Instant::now();
                     res
                 }
-                Some(Err(WsError::Io(ref io_err)))
+                Err(WsError::Io(ref io_err))
                     if io_err.kind() == std::io::ErrorKind::TimedOut
                         || io_err.kind() == std::io::ErrorKind::WouldBlock =>
                 {
                     continue;
                 }
-                Some(Err(err)) => return Some(err),
-                None => return None,
+                Err(err) => return Some(err),
             };
 
             if opcode != WS_OPCODE_TEXT {
@@ -516,7 +511,7 @@ impl ReportTransport {
     }
 
     fn read_idle_timeout(&self) -> Duration {
-        let interval = self.report_interval(Duration::from_secs(DEFAULT_WSS_REPORT_INTERVAL_SEC as u64));
+        let interval = self.report_interval(Duration::from_secs(DEFAULT_WSS_REPORT_INTERVAL_SEC));
         let timeout = interval + WSS_READ_IDLE_GRACE;
         if timeout < WSS_READ_IDLE_MIN {
             WSS_READ_IDLE_MIN
@@ -640,11 +635,7 @@ impl ReportTransport {
         }
         let inner = self.inner.lock().unwrap();
         let (guard, _timeout_res) = self.wake_cv.wait_timeout(inner, d).unwrap();
-        if self.shutdown.load(AtomicOrdering::Relaxed) || guard.stopped {
-            false
-        } else {
-            true
-        }
+        !(self.shutdown.load(AtomicOrdering::Relaxed) || guard.stopped)
     }
 }
 

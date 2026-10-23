@@ -304,7 +304,7 @@ fn schedule_windows_file_removal(path: &str) -> bool {
         quote_powershell_literal(&dir)
     );
     let mut cmd = Command::new("powershell.exe");
-    cmd.args(&["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script]);
+    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script]);
     cmd.spawn().is_ok()
 }
 

@@ -182,7 +182,7 @@ impl Agent {
         };
         let rx_monthly = *self.monthly_rx.lock().unwrap();
         let tx_monthly = *self.monthly_tx.lock().unwrap();
-        let disk_io = self.disk_io.lock().unwrap().clone();
+        let disk_io = *self.disk_io.lock().unwrap();
         let m = self.build_metrics(cfg, &cpu, net_now, rx_speed, tx_speed, rx_monthly, tx_monthly, disk_io);
 
         let (ts, _) = self.clock.lock().unwrap().timestamp(now);

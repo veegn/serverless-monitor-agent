@@ -20,6 +20,7 @@ pub fn valid_config_md5(value: &str) -> bool {
     value.len() == 32 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn remote_config_differs(
     cfg: &Config,
     values: &HashMap<String, String>,

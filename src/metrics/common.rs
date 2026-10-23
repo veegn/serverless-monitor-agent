@@ -272,11 +272,7 @@ pub fn disk_io_stats_from_counters(prev: DiskIOCounters, current: DiskIOCounters
 }
 
 pub fn counter_delta(prev: u64, current: u64) -> u64 {
-    if current < prev {
-        0
-    } else {
-        current - prev
-    }
+    current.saturating_sub(prev)
 }
 
 pub fn round_metric(v: f64) -> f64 {

@@ -98,16 +98,8 @@ pub fn calc_monthly_traffic<P: AsRef<Path>>(
         return Ok((st.rx_period, st.tx_period));
     }
 
-    let rx_delta = if current.rx >= st.rx_prev {
-        current.rx - st.rx_prev
-    } else {
-        0
-    };
-    let tx_delta = if current.tx >= st.tx_prev {
-        current.tx - st.tx_prev
-    } else {
-        0
-    };
+    let rx_delta = current.rx.saturating_sub(st.rx_prev);
+    let tx_delta = current.tx.saturating_sub(st.tx_prev);
 
     if period_start != 0 && st.period_start != 0 && period_start != st.period_start {
         st.rx_period = rx_delta;

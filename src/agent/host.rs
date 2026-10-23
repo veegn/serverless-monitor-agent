@@ -175,10 +175,10 @@ impl Agent {
             AGENT_WSS_MODE_ACTIVE => {
                 self.clear_wss_runtime_disabled(&reason);
             }
-            AGENT_WSS_MODE_INACTIVE | AGENT_WSS_MODE_DISABLED => {
-                if is_wss_schedule_inactive_reason(&reason) {
-                    self.disable_wss_runtime(&reason);
-                }
+            AGENT_WSS_MODE_INACTIVE | AGENT_WSS_MODE_DISABLED
+                if is_wss_schedule_inactive_reason(&reason) =>
+            {
+                self.disable_wss_runtime(&reason);
             }
             _ => {}
         }

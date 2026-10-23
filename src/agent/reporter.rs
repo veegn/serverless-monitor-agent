@@ -225,8 +225,12 @@ impl Agent {
 
             let mut sent = false;
             let rep = self.reporter.lock().unwrap().clone();
-            if self.uses_wss_config(cfg) && rep.is_some() && rep.as_ref().unwrap().connected() {
-                sent = rep.as_ref().unwrap().send(&body);
+            if self.uses_wss_config(cfg) {
+                if let Some(r) = rep.as_ref() {
+                    if r.connected() {
+                        sent = r.send(&body);
+                    }
+                }
             }
 
             if sent {

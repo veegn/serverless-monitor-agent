@@ -220,7 +220,7 @@ fn darwin_boot_time_ms() -> i64 {
         };
         if res == 0 {
             let tv = unsafe { boottime.assume_init() };
-            return (tv.tv_sec as i64) * 1000 + (tv.tv_usec as i64) / 1000;
+            return tv.tv_sec * 1000 + (tv.tv_usec as i64) / 1000;
         }
     }
     0

@@ -70,6 +70,7 @@ impl From<std::io::Error> for WsError {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum WsUnderlyingStream {
     Plain(TcpStream),
     Tls(StreamOwned<ClientConnection, TcpStream>),
@@ -143,7 +144,7 @@ pub fn dial_websocket(
         }
     }
 
-    let tcp = tcp_stream.ok_or_else(|| WsError::Protocol(last_err))?;
+    let tcp = tcp_stream.ok_or(WsError::Protocol(last_err))?;
 
     let mut stream = if is_tls {
         let tls_config = create_tls_config();
@@ -191,7 +192,7 @@ pub fn dial_websocket(
     reader.read_line(&mut status_line)?;
 
     let received = Instant::now();
-    let parts: Vec<&str> = status_line.trim().split_whitespace().collect();
+    let parts: Vec<&str> = status_line.split_whitespace().collect();
     if parts.len() < 2 {
         return Err(WsError::Protocol(format!("invalid HTTP status line: {:?}", status_line)));
     }

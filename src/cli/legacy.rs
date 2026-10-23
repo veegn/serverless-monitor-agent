@@ -112,6 +112,7 @@ pub fn extract_legacy_powershell_script_paths(raw: &str) -> Vec<String> {
     paths
 }
 
+#[allow(clippy::result_large_err)]
 pub fn read_install_config(paths: &Paths) -> Result<(Config, String), (Config, String, String)> {
     match read_config(&paths.config_file) {
         Ok(cfg) => Ok((cfg, paths.config_file.clone())),
@@ -154,6 +155,7 @@ pub fn migrate_traffic(paths: &Paths) -> Result<(), String> {
     }
     let _ = fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(&paths.traffic_file);
     Ok(())
