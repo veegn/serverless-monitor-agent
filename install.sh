@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO="huilang-me/cfsm-agent"
+REPO="veegn/serverless-monitor-agent"
 GITHUB_PROXY=""
 INSTALL_VERSION="latest"
 
@@ -61,7 +61,7 @@ check_darwin_version() {
     case "${cmd:-install}" in
         uninstall|remove|delete|purge)
             log "[WARN] macOS $ver is older than the supported minimum macOS 13 Ventura."
-            log "[WARN] the temporary uninstaller may not run; if it fails, run the installed 'cf-probe uninstall' directly."
+            log "[WARN] the temporary uninstaller may not run; if it fails, run the installed 'sma uninstall' directly."
             return 0
             ;;
     esac
@@ -175,7 +175,7 @@ stage_and_run_payload() {
         return 126
     fi
     mkdir -p "$dir" 2>/dev/null || return 125
-    stage="$dir/.cf-probe-bootstrap.$$"
+    stage="$dir/.sma-bootstrap.$$"
     stage_err="$stage.err"
     cp "$tmp" "$stage" 2>/dev/null || return 125
     chmod +x "$stage" 2>/dev/null || {
@@ -209,7 +209,7 @@ if [ "$os_name" = "darwin" ] && [ "$INSTALL_VERSION" = "latest" ]; then
     check_darwin_version
 fi
 arch_name="$(detect_arch)"
-asset="cf-probe-${os_name}-${arch_name}"
+asset="sma-${os_name}-${arch_name}"
 if [ "$os_name" = "windows" ]; then
     asset="${asset}.exe"
 fi
@@ -225,11 +225,11 @@ if [ -n "$GITHUB_PROXY" ]; then
 fi
 
 tmp_dir="${TMPDIR:-/tmp}"
-tmp="${tmp_dir%/}/cf-probe-bootstrap.$$"
+tmp="${tmp_dir%/}/sma-bootstrap.$$"
 tmp_err="$tmp.err"
 trap 'rm -f "$tmp" "$tmp_err"' EXIT INT TERM
 
-log "CF-Server-Monitor Go Probe bootstrap"
+log "Serverless Monitor Agent (sma) bootstrap"
 log "  repo    : $REPO"
 log "  version : $INSTALL_VERSION"
 log "  target  : $os_name/$arch_name"
@@ -254,7 +254,7 @@ fi
 
 log "[WARN] cannot execute bootstrap binary from $tmp; trying executable staging directories"
 if [ -n "${HOME:-}" ]; then
-    if stage_and_run_payload "$HOME/.cf-probe/tmp" "$@"; then
+    if stage_and_run_payload "$HOME/.sma/tmp" "$@"; then
         exit 0
     else
         status=$?

@@ -1,6 +1,6 @@
-# cfsm-agent
+# serverless-monitor-agent
 
-`cfsm-agent` 是 CF-Server-Monitor 的 Go Probe Agent，安装后会以 `cf-probe` 服务运行，定时采集服务器资源、网络流量和探测数据，并上报到指定的 Worker 地址。
+`serverless-monitor-agent` 是探针 Agent（运行服务名与二进制为 `sma`），定时采集服务器资源、网络流量和探测数据，并上报到指定的 Worker 地址。
 
 ## 快速安装
 
@@ -13,69 +13,72 @@
 Linux、OpenWrt、Synology DSM、FreeBSD、macOS 可使用安装脚本自动下载当前系统对应的最新 release：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/huilang-me/cfsm-agent/main/install.sh | sh -s -- install -id=SERVER_ID -secret=SECRET -url=WORKER_URL
+curl -fsSL https://raw.githubusercontent.com/veegn/serverless-monitor-agent/main/install.sh | sh -s -- install -id=SERVER_ID -secret=SECRET -url=WORKER_URL
 ```
 
 如果系统没有 `curl`，可使用 `wget`：
 
 ```bash
-wget -O- https://raw.githubusercontent.com/huilang-me/cfsm-agent/main/install.sh | sh -s -- install -id=SERVER_ID -secret=SECRET -url=WORKER_URL
+wget -O- https://raw.githubusercontent.com/veegn/serverless-monitor-agent/main/install.sh | sh -s -- install -id=SERVER_ID -secret=SECRET -url=WORKER_URL
 ```
 
 ### 普通用户安装（非 root）
 
-支持 `systemd --user` 的 Linux 可使用非 root 安装；执行安装时会使用当前用户，不会新建用户；二进制、配置和流量文件会写入 `~/.cf-probe/`，自启动使用 `systemd --user`。Synology DSM、OpenWrt、Alpine/OpenRC 以及其他不支持 `systemd --user` 的系统请使用 root 权限安装。部分 Linux 系统从旧的 root Go 版切换到非 root 安装时，需要先在 root 下卸载旧版 agent.
+支持 `systemd --user` 的 Linux 可使用非 root 安装；执行安装时会使用当前用户，不会新建用户；二进制、配置和流量文件会写入 `~/.sma/`，自启动使用 `systemd --user`。Synology DSM、OpenWrt、Alpine/OpenRC 以及其他不支持 `systemd --user` 的系统请使用 root 权限安装。部分 Linux 系统从旧的 root 版切换到非 root 安装时，需要先在 root 下卸载旧版 agent.
 
-## 自动发现安装（不传 `-id`）
+## 服务发现自动注册安装（推荐，仅需 Token）
 
-服务端在「设置 → 站点设置」开启**自动发现**后，安装时可以省略 `-id`，由服务端在首次上报时自动建号。
+服务端在「设置 → 站点设置」开启**自动发现**后，注册探针仅需要服务端授权 Token 与 Worker URL 即可快速纳管 VPS：
+- 省略 `-id`：由服务端在首次上报时自动创建服务器并分配 ID。
+- 省略 `-name`：自动获取本机操作系统主机名（`hostname`）作为服务器名称。
+- 支持断网故障容灾与本地缓存，详细交互协议见 [协议规范文档](docs/PROTOCOL.md)。
 
 Linux、OpenWrt、Synology DSM、FreeBSD、macOS：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/huilang-me/cfsm-agent/main/install.sh | sh -s -- install -secret=SECRET -url=WORKER_URL
+curl -fsSL https://raw.githubusercontent.com/veegn/serverless-monitor-agent/main/install.sh | sh -s -- install -token=TOKEN -url=WORKER_URL
 ```
 
-指定服务器名称（不传则使用本机公网 IPv4，没有 IPv4 时使用 IPv6）：
+若需自定义服务器名称：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/huilang-me/cfsm-agent/main/install.sh | sh -s -- install -secret=SECRET -url=WORKER_URL -name=hk-1
+curl -fsSL https://raw.githubusercontent.com/veegn/serverless-monitor-agent/main/install.sh | sh -s -- install -token=TOKEN -url=WORKER_URL -name=my-server
 ```
 
 Windows（管理员 PowerShell）：
 
 ```powershell
-$script = "$env:TEMP\install-cf-probe.ps1"
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/huilang-me/cfsm-agent/main/install.ps1" -OutFile $script -UseBasicParsing
-PowerShell -ExecutionPolicy Bypass -File $script install -secret=SECRET -url=WORKER_URL -name=hk-1
+$script = "$env:TEMP\install-sma.ps1"
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/veegn/serverless-monitor-agent/main/install.ps1" -OutFile $script -UseBasicParsing
+PowerShell -ExecutionPolicy Bypass -File $script install -token=TOKEN -url=WORKER_URL
 ```
 
-不传 `-id` 时，Agent 启动后只走 POST 上报：首次上报由服务端创建服务器并返回 ID，Agent 立即写入配置文件（`SERVER_ID`），随后按服务端下发的 `connection_mode` 决定是否切换到 WSS。建号成功的日志为「自动发现已创建服务器」，约 2 分钟后面板才会显示该服务器。若写入配置失败，ID 仍会在本次运行内生效，Agent 会在后续上报中持续重试写入；若始终写不进去，重启后会重新走建号流程——同名会中止退出，名称变化（例如公网 IP 改变）则会建出一台重复服务器，请及时修复配置目录权限。服务端已存在同名服务器（`reused`）、建号失败（`failed`），或服务端未开启自动发现（空 `id` 上报只收到普通 404）时，Agent 只输出一条提示便直接退出：既不复用同名服务器、也不重试，磁盘上不会留下任何标记文件；服务管理器的重启策略已改为仅在异常退出时重启，因此不会被自动拉起（`systemctl status cf-probe` 显示为已停止）。修复后重新执行 `install` 并传入 `-id` 即可恢复。
+不传 `-id` 时，Agent 启动后只走 POST 上报：首次上报由服务端创建服务器并返回 ID，Agent 立即写入配置文件（`SERVER_ID`），随后按服务端下发的 `connection_mode` 决定是否切换到 WSS。建号成功的日志为「自动发现已创建服务器」，约 2 分钟后面板才会显示该服务器。若写入配置失败，ID 仍会在本次运行内生效，Agent 会在后续上报中持续重试写入；若始终写不进去，重启后会重新走建号流程——同名会中止退出，名称变化（例如公网 IP 改变）则会建出一台重复服务器，请及时修复配置目录权限。服务端已存在同名服务器（`reused`）、建号失败（`failed`），或服务端未开启自动发现（空 `id` 上报只收到普通 404）时，Agent 只输出一条提示便直接退出：既不复用同名服务器、也不重试，磁盘上不会留下任何标记文件；服务管理器的重启策略已改为仅在异常退出时重启，因此不会被自动拉起（`systemctl status sma` 显示为已停止）。修复后重新执行 `install` 并传入 `-id` 即可恢复。
 
 ## Windows 安装
 
 请使用管理员权限打开 PowerShell，然后执行：
 
 ```powershell
-$script = "$env:TEMP\install-cf-probe.ps1"
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/huilang-me/cfsm-agent/main/install.ps1" -OutFile $script -UseBasicParsing
+$script = "$env:TEMP\install-sma.ps1"
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/veegn/serverless-monitor-agent/main/install.ps1" -OutFile $script -UseBasicParsing
 PowerShell -ExecutionPolicy Bypass -File $script install -id=SERVER_ID -secret=SECRET -url=WORKER_URL
 ```
 
-Windows 上如果安装时开启 `-auto_update=1`，自动更新会下载并执行 `C:\ProgramData\cf-probe\cf-probe-update.exe`，部分杀毒软件或安全策略可能拦截。被拦截时请将 `C:\Program Files\cf-probe\cf-probe.exe`、`C:\ProgramData\cf-probe\cf-probe-update.exe`、`C:\ProgramData\cf-probe\cf-probe.cmd` 加入白名单；如环境不允许放行，建议保持 `-auto_update=0`，需要升级时手动指定版本安装。
+Windows 上如果安装时开启 `-auto_update=1`，自动更新会下载并执行 `C:\ProgramData\sma\sma-update.exe`，部分杀毒软件或安全策略可能拦截。被拦截时请将 `C:\Program Files\sma\sma.exe`、`C:\ProgramData\sma\sma-update.exe`、`C:\ProgramData\sma\sma.cmd` 加入白名单；如环境不允许放行，建议保持 `-auto_update=0`，需要升级时手动指定版本安装。
 
 ## 指定版本或 GitHub 代理
 
 默认安装最新 release。需要指定版本时：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/huilang-me/cfsm-agent/main/install.sh | sh -s -- install --install-version=v1.0.10 -id=SERVER_ID -secret=SECRET -url=WORKER_URL
+curl -fsSL https://raw.githubusercontent.com/veegn/serverless-monitor-agent/main/install.sh | sh -s -- install --install-version=v1.0.10 -id=SERVER_ID -secret=SECRET -url=WORKER_URL
 ```
 
 GitHub 下载较慢时，可以配置代理前缀：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/huilang-me/cfsm-agent/main/install.sh | sh -s -- install --install-ghproxy=https://gh-proxy.example.com -id=SERVER_ID -secret=SECRET -url=WORKER_URL
+curl -fsSL https://raw.githubusercontent.com/veegn/serverless-monitor-agent/main/install.sh | sh -s -- install --install-ghproxy=https://gh-proxy.example.com -id=SERVER_ID -secret=SECRET -url=WORKER_URL
 ```
 
 ## 常用安装参数
@@ -83,8 +86,9 @@ curl -fsSL https://raw.githubusercontent.com/huilang-me/cfsm-agent/main/install.
 | 参数 | 说明 | 默认值 |
 | --- | --- | --- |
 | `-id=SERVER_ID` | 服务器 ID，首次安装必填；服务端开启自动发现时可省略 | 无 |
-| `-name=NAME` | 自动建号时的服务器名称，未传则使用本机公网 IPv4（无 IPv4 时用 IPv6） | 公网 IP |
-| `-secret=SECRET` | 服务器密钥，首次安装必填 | 无 |
+| `-name=NAME` | 服务器名称，未传时自动使用操作系统主机名 (`hostname`) | `hostname` |
+| `-token=TOKEN` | 服务端授权 Token，首次安装必填（等价于 `-secret`） | 无 |
+| `-secret=SECRET` | 服务器密钥 / 授权 Token，首次安装必填 | 无 |
 | `-url=WORKER_URL` | Worker 上报地址，首次安装必填 | 无 |
 | `-interval=N` | 上报间隔，单位秒 | `60` |
 | `-collect_interval=N` | 采样间隔，单位秒；WSS auto 开启时为 `0` 或大于 `WSS_REPORT_INTERVAL` 会按 `WSS_REPORT_INTERVAL` 采样 | `0` |
@@ -103,17 +107,17 @@ curl -fsSL https://raw.githubusercontent.com/huilang-me/cfsm-agent/main/install.
 
 再次执行 `install` 时，如果本机已有配置文件，程序会以已有配置为基础，只覆盖本次显式传入的参数，未传入的参数保留旧值（例如只传 `-auto_update=1` 就只修改自动更新开关）。首次安装（本机无已有配置）时 `-secret`、`-url` 必填；`-id` 在服务端开启自动发现时可省略，具体见[自动发现安装](#自动发现安装不传--id)。
 
-自动更新默认关闭。安装时传入 `-auto_update=1` 后，Agent 启动时会检查 GitHub release，之后每 6 小时检查一次；稳定版按版本号更新，`Snapshot-` 版本会跟随最新可用 Snapshot prerelease。自动更新只由本地 `AUTO_UPDATE` 配置控制，不依赖面板返回 `update=1`。如果安装时配置了 `--install-ghproxy`，代理会写入本地配置并用于后续自动更新；该本地字段不参与远端配置 MD5 对比。自动更新的检查结果、调度结果和失败原因始终以 info 级日志输出，无需开启 debug；系统级 nohup 环境下安装过程的输出会追加到 `/var/log/cf-probe.log`，systemd 环境可通过 `journalctl -u 'cf-probe-auto-update-*'` 查看。
+自动更新默认关闭。安装时传入 `-auto_update=1` 后，Agent 启动时会检查 GitHub release，之后每 6 小时检查一次；稳定版按版本号更新，`Snapshot-` 版本会跟随最新可用 Snapshot prerelease。自动更新只由本地 `AUTO_UPDATE` 配置控制，不依赖面板返回 `update=1`。如果安装时配置了 `--install-ghproxy`，代理会写入本地配置并用于后续自动更新；该本地字段不参与远端配置 MD5 对比。自动更新的检查结果、调度结果和失败原因始终以 info 级日志输出，无需开启 debug；系统级 nohup 环境下安装过程的输出会追加到 `/var/log/sma.log`，systemd 环境可通过 `journalctl -u 'sma-auto-update-*'` 查看。
 
 自动更新要求目标 release 提供 `checksums.txt`，且其中包含对应资产的 SHA-256；校验文件不可用、校验不符、下载为空或超出 512 MiB 时会停止本次更新，继续运行当前版本。Linux ARM32 按当前二进制构建时的 `GOARM` 选择 `armv5`、`armv6` 或 `armv7` 资产；无法确定兼容级别时跳过自动更新。ARMv6/v7 的软浮点构建也会跳过自动更新，避免替换为需要硬件浮点的发布资产。
 
-普通用户安装时，自动更新会在 `~/.cf-probe/` 内下载并替换当前用户的二进制，随后退出当前进程，由 `systemd --user` 或 macOS LaunchAgent 按服务重启策略拉起新版本；不会触碰 root 路径或系统级服务。
+普通用户安装时，自动更新会在 `~/.sma/` 内下载并替换当前用户的二进制，随后退出当前进程，由 `systemd --user` 或 macOS LaunchAgent 按服务重启策略拉起新版本；不会触碰 root 路径或系统级服务。
 
-更新检查（`api.github.com`）、新二进制下载（`github.com`）、指标上报以及公网 IP 查询的 DNS 解析默认使用系统原生 DNS；仅在配置了 `--install-ghproxy`（通常为系统 DNS 被污染的国内服务器）或通过环境变量 `CF_PROBE_UPDATE_DNS` 显式指定 DNS 服务器时，才启用 Agent 内置的公共 DNS 轮询解析（阿里、DNSPod、114、Cloudflare、Google，UDP 53），此时不依赖系统 DNS，内置 DNS 全部不可用时回退系统 DNS。`CF_PROBE_UPDATE_DNS` 会自动补全 `:53` 端口（如 `CF_PROBE_UPDATE_DNS=223.5.5.5`）。root/system 模式更新时 Agent 会把新二进制下载到配置目录，再调度新二进制执行自身的 `install` 完成替换并重启服务；普通用户模式按上一段直接自替换。两种模式都不经过 install.sh 和 curl；下载或调度失败时旧版本不受影响，下次检查自动重试。如 `github.com` 完全不可达，可配置 `--install-ghproxy` 代理（仅用于二进制文件下载；`api.github.com` 的版本检查始终直连，gh-proxy 类服务不支持 API 转发）。
+更新检查（`api.github.com`）、新二进制下载（`github.com`）、指标上报以及公网 IP 查询的 DNS 解析默认使用系统原生 DNS；仅在配置了 `--install-ghproxy`（通常为系统 DNS 被污染的国内服务器）或通过环境变量 `CF_PROBE_UPDATE_DNS` 显式指定 DNS 服务器时，才启用 Agent 内置的公共 DNS 轮询解析（阿里、DNSPod、114、Cloudflare、Google，UDP 53），此时不依赖系统 DNS，内置 DNS 全部不可用时回退系统 DNS。`CF_PROBE_UPDATE_DNS` 会自动补全 `:53`端口（如 `CF_PROBE_UPDATE_DNS=223.5.5.5`）。root/system 模式更新时 Agent 会把新二进制下载到配置目录，再调度新二进制执行自身的 `install` 完成替换并重启服务；普通用户模式按上一段直接自替换。两种模式都不经过 install.sh 和 curl；下载或调度失败时旧版本不受影响，下次检查自动重试。如 `github.com` 完全不可达，可配置 `--install-ghproxy` 代理（仅用于二进制文件下载；`api.github.com` 的版本检查始终直连，gh-proxy 类服务不支持 API 转发）。
 
 ## 支持的架构
 
-安装脚本根据 `uname -m` 选择对应的 release 资产（资产名形如 `cf-probe-linux-<后缀>`）：
+安装脚本根据 `uname -m` 选择对应的 release 资产（资产名形如 `sma-linux-<后缀>`）：
 
 | `uname -m` | 资产后缀 |
 | --- | --- |
@@ -135,14 +139,14 @@ MIPS（常见于 OpenWrt 路由器）资产统一使用 `GOMIPS=softfloat` 构�
 
 | 系统 | 二进制默认位置 | 配置文件 | 日志 |
 | --- | --- | --- | --- |
-| Linux non-root (`systemd --user`) | `~/.cf-probe/bin/cf-probe` | `~/.cf-probe/config.conf` | `journalctl --user -u cf-probe -f` |
-| Linux / Synology DSM | `/usr/local/bin/cf-probe` | `/etc/config/cf-probe/config.conf` | `journalctl -u cf-probe -f` |
-| OpenWrt | `/usr/bin/cf-probe` | `/etc/config/cf-probe/config.conf` | `/var/log/cf-probe.log` |
-| FreeBSD | `/usr/local/bin/cf-probe` | `/etc/config/cf-probe/config.conf` | `/var/log/cf-probe.log` |
-| macOS (`LaunchAgent`) | `~/.cf-probe/bin/cf-probe` | `~/.cf-probe/config.conf` | `~/.cf-probe/cf-probe.log` |
-| Windows | `C:\Program Files\cf-probe\cf-probe.exe` | `C:\ProgramData\cf-probe\config.conf` | `C:\ProgramData\cf-probe\cf-probe.log` |
+| Linux non-root (`systemd --user`) | `~/.sma/bin/sma` | `~/.sma/config.conf` | `journalctl --user -u sma -f` |
+| Linux / Synology DSM | `/usr/local/bin/sma` | `/etc/config/sma/config.conf` | `journalctl -u sma -f` |
+| OpenWrt | `/usr/bin/sma` | `/etc/config/sma/config.conf` | `/var/log/sma.log` |
+| FreeBSD | `/usr/local/bin/sma` | `/etc/config/sma/config.conf` | `/var/log/sma.log` |
+| macOS (`LaunchAgent`) | `~/.sma/bin/sma` | `~/.sma/config.conf` | `~/.sma/sma.log` |
+| Windows | `C:\Program Files\sma\sma.exe` | `C:\ProgramData\sma\config.conf` | `C:\ProgramData\sma\sma.log` |
 
-服务名固定为 `cf-probe`。服务会根据系统自动注册为 `systemd`、`OpenRC`、`procd`、`launchd`、Synology rc、Windows 计划任务，或在不支持服务管理器的环境中后台运行。
+服务名固定为 `sma`。服务会根据系统自动注册为 `systemd`、`OpenRC`、`procd`、`launchd`、Synology rc、Windows 计划任务，或在不支持服务管理器的环境中后台运行。
 
 Linux 普通用户安装固定使用 `systemd --user`；root 安装仍使用系统级服务。macOS 固定使用当前用户 LaunchAgent，不再安装 root/system 版。普通用户安装会阻止与其他用户或 root 版实例重复运行，但允许覆盖安装当前用户自己的运行实例。
 
@@ -151,73 +155,73 @@ Linux 普通用户安装固定使用 `systemd --user`；root 安装仍使用系�
 Linux non-root (`systemd --user`)：
 
 ```bash
-systemctl --user status cf-probe
-journalctl --user -u cf-probe -f
+systemctl --user status sma
+journalctl --user -u sma -f
 ```
 
 systemd 系统：
 
 ```bash
-sudo systemctl status cf-probe
-sudo journalctl -u cf-probe -f
+sudo systemctl status sma
+sudo journalctl -u sma -f
 ```
 
 OpenRC（Alpine 等）：
 
 ```bash
-rc-service cf-probe status
-tail -f /var/log/cf-probe.log
+rc-service sma status
+tail -f /var/log/sma.log
 ```
 
 OpenWrt：
 
 ```bash
-/etc/init.d/cf-probe status
+/etc/init.d/sma status
 logread -f
 ```
 
 FreeBSD：
 
 ```bash
-ps aux | grep cf-probe
-tail -f /var/log/cf-probe.log
+ps aux | grep sma
+tail -f /var/log/sma.log
 ```
 
 macOS：
 
 ```bash
-launchctl print gui/$(id -u)/com.cfsm.cf-probe
-tail -f ~/.cf-probe/cf-probe.log
+launchctl print gui/$(id -u)/com.serverless.sma
+tail -f ~/.sma/sma.log
 ```
 
 Windows：
 
 ```powershell
-Get-ScheduledTask -TaskName cf-probe
-Get-Content "C:\ProgramData\cf-probe\cf-probe.log" -Wait
+Get-ScheduledTask -TaskName sma
+Get-Content "C:\ProgramData\sma\sma.log" -Wait
 ```
 
 ## 卸载
 
-推荐使用安装脚本触发卸载。脚本会下载临时 `cf-probe` 执行卸载，避免 Windows 下运行中的已安装程序无法删除自身。
+推荐使用安装脚本触发卸载。脚本会下载临时 `sma` 执行卸载，避免 Windows 下运行中的已安装程序无法删除自身。
 
 Linux、OpenWrt、Synology DSM、FreeBSD、macOS：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/huilang-me/cfsm-agent/main/install.sh | sh -s -- uninstall
+curl -fsSL https://raw.githubusercontent.com/veegn/serverless-monitor-agent/main/install.sh | sh -s -- uninstall
 ```
 
-普通用户执行卸载只清理当前用户的 `~/.cf-probe/`、支持 `systemd --user` 的 Linux 用户服务或 macOS LaunchAgent 自启动项；Synology DSM、OpenWrt、Alpine/OpenRC 以及其他系统级安装请使用 root 权限卸载。root 执行卸载清理系统级安装。macOS root 卸载会同时清理 sudo 调用者对应的用户版安装；旧 root/system 版请先执行 `sudo /usr/local/bin/cf-probe uninstall` 清理，再以普通用户安装。
+普通用户执行卸载只清理当前用户的 `~/.sma/`、支持 `systemd --user` 的 Linux 用户服务或 macOS LaunchAgent 自启动项；Synology DSM、OpenWrt、Alpine/OpenRC 以及其他系统级安装请使用 root 权限卸载。root 执行卸载清理系统级安装。macOS root 卸载会同时清理 sudo 调用者对应的用户版安装；旧 root/system 版请先执行 `sudo /usr/local/bin/sma uninstall` 清理，再以普通用户安装。
 
 Windows 请使用管理员权限打开 PowerShell：
 
 ```powershell
-$script = "$env:TEMP\install-cf-probe.ps1"
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/huilang-me/cfsm-agent/main/install.ps1" -OutFile $script -UseBasicParsing
+$script = "$env:TEMP\install-sma.ps1"
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/veegn/serverless-monitor-agent/main/install.ps1" -OutFile $script -UseBasicParsing
 PowerShell -ExecutionPolicy Bypass -File $script uninstall
 ```
 
-卸载会清理当前 Go 版默认安装创建的固定位置和自启动项，不处理旧脚本或手动放置到其他路径的文件。
+卸载会清理当前默认安装创建的固定位置和自启动项，不处理旧脚本或手动放置到其他路径的文件。
 
 ## 上报数据说明
 
@@ -480,95 +484,45 @@ WSS 握手会携带标准 WebSocket Upgrade 头，并附带以下 Agent 头：
 
 其中 `rx_correction` 和 `tx_correction` 为 number，单位 GB。该确认请求只携带 `Content-Type`、`Accept` 和 `User-Agent` 头。
 
-## Docker 部署
+## GitHub CI 自动构建
 
-除安装脚本外，也可以把 Agent 以容器方式运行。镜像以 `cf-probe run` 前台模式启动，后台常驻、开机自启和崩溃重启都交给 Docker 的重启策略；容器内不使用 systemd/launchd，也不会触碰裸机安装路径。
+本项目通过 GitHub Actions 自动化 CI/CD（`.github/workflows/release.yml` 和 `.github/workflows/snapshot.yml`）提供全平台交叉编译二进制产物：
 
-镜像发布在 `ghcr.io/<owner>/cfsm-agent`，提供 `latest`、版本号和 commit sha 标签（多架构 `linux/amd64`、`linux/arm64`）。
-
-推荐以 host 网络模式运行，这样网卡流量、月流量和 TCP/UDP 连接数才是宿主机的真实数据：
-
-```bash
-docker run -d --name cf-probe \
-  --restart=unless-stopped \
-  --network=host \
-  -v cf-probe-data:/data \
-  -e SERVER_ID=SERVER_ID \
-  -e SECRET=SECRET \
-  -e WORKER_URL=https://example.com/update \
-  ghcr.io/<owner>/cfsm-agent:latest
-```
-
-配置通过环境变量传入，名称与安装参数一致，`entrypoint.sh` 会把它们写入 `/data/config.conf`。若 `/data` 已存在配置文件，则只覆盖本次显式设置的环境变量，保留其余字段（包括服务端动态下发的 `INTERFACE`、`COLLECT_INTERVAL`、`CONNECTION_MODE`、`CONFIG_MD5` 等），因此重启不会丢失下发配置。
-
-| 环境变量 | 说明 | 默认值 |
-| --- | --- | --- |
-| `SERVER_ID` | 服务器 ID，首次启动必填 | 无 |
-| `SECRET` | 服务器密钥，首次启动必填 | 无 |
-| `WORKER_URL` | Worker 上报地址，首次启动必填 | 无 |
-| `REPORT_INTERVAL` | 上报间隔，单位秒 | `60` |
-| `COLLECT_INTERVAL` | 采样间隔，单位秒 | `0` |
-| `CT_NODE` / `CU_NODE` / `CM_NODE` / `BD_NODE` | 电信/联通/移动/BGP 测试节点 | 空 |
-| `INTERFACE` | 指定统计网卡，多个用英文逗号分隔 | 自动汇总 |
-| `RESET_DAY` | 每月流量重置日 `1-31`，`0` 表示不重置 | `1` |
-| `CONNECTION_MODE` | 连接模式 `auto`/`http` | `auto` |
-| `PING_MODE` | Ping 模式 `tcp`/`icmp`；`icmp` 需追加 `--cap-add=NET_RAW` | `tcp` |
-| `UPDATE_PROXY` | 二进制下载的 GitHub 代理前缀 | 空 |
-| `CF_PROBE_DEBUG` | 设为 `1` 开启调试日志 | 空 |
-
-修改配置：`docker rm -f cf-probe` 后用新的 `-e` 参数重新 `docker run`（挂载卷会保留，只覆盖显式传入项）。
-
-**升级方式**：`docker pull` 新镜像后重建容器。容器内 `AUTO_UPDATE` 恒为 `0`，禁用二进制自更新——因为自替换的二进制只存在于容器可写层，重建容器或更新镜像时会被镜像内的版本重新覆盖，导致版本回退。请通过更新镜像而非容器内自更新来升级。
-
-**容器视角的监控边界**：
-
-- 开箱即准确：CPU、内存/Swap、负载、启动时间、操作系统/内核/CPU 信息、公网 IPv4/IPv6、Ping 探测（需容器可出网）。
-- 依赖 `--network=host`：网卡累计流量与网速、月流量、TCP/UDP 连接数。不加时只能看到容器自身 `eth0` 的少量流量，且容器重启后计数归零、`-interface` 指定宿主网卡会匹配为空。
-- 磁盘容量：容器内按底层文件系统标识（`statfs` 的 `f_fsid`）去重统计，可避免 overlay 根与同源数据卷被重复累加；对**单盘宿主**，容器总/已用容量与宿主机一致。但**未挂载进容器的其它独立数据盘**仍无法看到（受 mount namespace 限制）。
-- 本期容器方式不覆盖（值会缺失或不准）：磁盘 IO、进程数（受 pid/mount namespace 限制）、GPU（需驱动与设备透传进镜像）。这些指标在裸机安装方式下不受影响。
-
-### 本地构建镜像
-
-镜像不在容器内编译，需先产出静态二进制到 `dist/`：
-
-```bash
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
-  -ldflags "-s -w -X main.version=dev" -o dist/cf-probe-linux-amd64 ./cmd/cf-probe
-docker build -t cfsm-agent:local .
-```
-
-多架构构建：
-
-```bash
-docker buildx build --platform linux/amd64,linux/arm64 -t cfsm-agent:local --load .
-```
+- **自动化构建目标**：
+  - Linux: `x86_64` (amd64), `aarch64` (arm64), `i686` (386), `armv7` 等（基于 musl 静态链接，无需依赖系统 libc）
+  - macOS: `x86_64` (Intel), `aarch64` (Apple Silicon)
+  - Windows: `x86_64`, `aarch64`, `i686`
+  - FreeBSD: `x86_64`
+- **校验和保障**：每次构建自动生成 `checksums.txt`（包含各二进制的 SHA-256 校验和），发布至 GitHub Releases，保证更新和安装的完整性与安全性。
 
 ## 从源码构建
 
-需要 Go `1.27.3` 或更新版本。
+需要 Rust `1.80` 或更新版本（带有 Cargo）。
 
 ```bash
-git clone https://github.com/huilang-me/cfsm-agent.git
-cd cfsm-agent
-go build -trimpath -ldflags "-s -w -X main.version=$(git describe --tags --always --dirty)" -o cf-probe ./cmd/cf-probe
+git clone https://github.com/veegn/serverless-monitor-agent.git
+cd serverless-monitor-agent
+cargo build --release
 ```
+
+编译产出的二进制文件位于 `target/release/sma`。
 
 构建后可直接安装：
 
 ```bash
-./cf-probe install -id=SERVER_ID -secret=SECRET -url=WORKER_URL
+./target/release/sma install -id=SERVER_ID -secret=SECRET -url=WORKER_URL
 ```
 
 前台调试运行：
 
 ```bash
-./cf-probe run -config ./config.conf -debug=1
+./target/release/sma run -config ./config.conf -debug=1
 ```
 
 查看帮助：
 
 ```bash
-./cf-probe help
+./target/release/sma help
 ```
 
 ## 致谢

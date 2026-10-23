@@ -20,58 +20,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          go-version-file: go.mod
+          targets: x86_64-unknown-linux-musl
 
-      - name: Cross compile representative targets
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          VERSION="ci-${GITHUB_SHA::7}"
-          LDFLAGS="-s -w -X main.version=${VERSION}"
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-          # $4 = GOARM, $5 = GOMIPS/GOMIPS64 (MIPS assets are softfloat so they
-          # also run on router CPUs without an FPU)
-          build_one() {
-            goos="$1"
-            goarch="$2"
-            suffix="$3"
-            goarm="${4:-}"
-            gomips="${5:-}"
-            output="dist/cf-probe-${goos}-${suffix}"
-            if [ "$goos" = "windows" ]; then
-              output="${output}.exe"
-            fi
-            echo "Building ${goos}/${goarch} -> ${output}"
-            (
-              if [ -n "$goarm" ]; then
-                export GOARM="$goarm"
-              fi
-              case "$goarch" in
-                mips|mipsle)
-                  if [ -n "$gomips" ]; then
-                    export GOMIPS="$gomips"
-                  fi
-                  ;;
-                mips64|mips64le)
-                  if [ -n "$gomips" ]; then
-                    export GOMIPS64="$gomips"
-                  fi
-                  ;;
-              esac
-              GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 \
-                go build -trimpath -ldflags="$LDFLAGS" -o "$output" ./cmd/cf-probe
-            )
-          }
-
-          build_one linux amd64 amd64
-          build_one linux arm64 arm64
-          build_one linux arm armv7 7
-          build_one linux loong64 loong64
-          build_one linux mipsle mipsle "" softfloat
-          build_one freebsd amd64 amd64
-          build_one darwin arm64 arm64
-          build_one windows amd64 amd64
-
+      - name: Build representative musl target
+        run: cargo build --release --target x86_64-unknown-linux-musl

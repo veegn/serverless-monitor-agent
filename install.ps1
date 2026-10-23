@@ -1,16 +1,16 @@
-﻿$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Stop"
 
 # Installing/uninstalling writes to C:\Program Files and registers a SYSTEM
 # scheduled task, both of which require an elevated (administrator) session.
 # Fail fast with a clear prompt instead of a raw "Access is denied" later.
 $cfPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $cfPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Host "[ERROR] 安装或卸载 cf-probe 需要管理员权限。" -ForegroundColor Red
+    Write-Host "[ERROR] 安装或卸载 sma 需要管理员权限。" -ForegroundColor Red
     Write-Host "请右键点击 PowerShell，选择“以管理员身份运行”，然后重新执行本命令。" -ForegroundColor Yellow
     exit 1
 }
 
-$Repo = "huilang-me/cfsm-agent"
+$Repo = "veegn/serverless-monitor-agent"
 $GitHubProxy = ""
 $InstallVersion = "latest"
 
@@ -67,15 +67,15 @@ if ($command -in @("uninstall", "remove", "delete", "purge")) {
 }
 
 $arch = Get-ArchName
-$asset = "cf-probe-windows-$arch.exe"
+$asset = "sma-windows-$arch.exe"
 $path = if ($InstallVersion -eq "latest") { "latest/download" } else { "download/$InstallVersion" }
 $url = "https://github.com/$Repo/releases/$path/$asset"
 if ($GitHubProxy) {
     $url = $GitHubProxy.TrimEnd("/") + "/" + $url
 }
 
-$tmp = Join-Path $env:TEMP "cf-probe-bootstrap-$PID.exe"
-Write-Host "CF-Server-Monitor Go Probe bootstrap"
+$tmp = Join-Path $env:TEMP "sma-bootstrap-$PID.exe"
+Write-Host "Serverless Monitor Agent (sma) bootstrap"
 Write-Host "  repo    : $Repo"
 Write-Host "  version : $InstallVersion"
 Write-Host "  target  : windows/$arch"

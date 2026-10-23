@@ -1,0 +1,34 @@
+[package]
+name = "serverless-monitor-agent"
+version = "1.0.0"
+edition = "2021"
+authors = ["huilang-me"]
+description = "Serverless Monitor Agent"
+
+[[bin]]
+name = "sma"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1.0"
+ring = "0.17"
+sha2 = "0.10"
+sha1 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+regex = "1.13.1"
+url = "2.5.8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

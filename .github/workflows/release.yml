@@ -4,6 +4,9 @@ on:
   release:
     types:
       - published
+  push:
+    tags:
+      - "v*"
 
 permissions:
   contents: write
@@ -12,85 +15,111 @@ jobs:
   test:
     uses: ./.github/workflows/test.yml
 
-  build-and-upload:
+  build:
     needs: test
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+            asset_name: sma-linux-amd64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+            asset_name: sma-linux-arm64
+          - target: i686-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+            asset_name: sma-linux-386
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-latest
+            use_cross: true
+            asset_name: sma-linux-armv7
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            use_cross: false
+            asset_name: sma-darwin-amd64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use_cross: false
+            asset_name: sma-darwin-arm64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
+            asset_name: sma-windows-amd64.exe
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
+            asset_name: sma-windows-arm64.exe
+          - target: i686-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
+            asset_name: sma-windows-386.exe
+          - target: x86_64-unknown-freebsd
+            os: ubuntu-latest
+            use_cross: true
+            asset_name: sma-freebsd-amd64
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          go-version-file: go.mod
+          targets: ${{ matrix.target }}
 
-      - name: Build release binaries
-        env:
-          VERSION: ${{ github.event.release.tag_name }}
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build binary (cross)
+        if: matrix.use_cross
         run: |
-          set -euo pipefail
+          cross build --release --target ${{ matrix.target }}
           mkdir -p dist
-          LDFLAGS="-s -w -X main.version=${VERSION}"
+          cp target/${{ matrix.target }}/release/sma dist/${{ matrix.asset_name }}
 
-          # $4 = GOARM, $5 = GOMIPS/GOMIPS64 (MIPS assets are softfloat so they
-          # also run on router CPUs without an FPU)
-          build_one() {
-            goos="$1"
-            goarch="$2"
-            suffix="$3"
-            goarm="${4:-}"
-            gomips="${5:-}"
-            output="dist/cf-probe-${goos}-${suffix}"
-            if [ "$goos" = "windows" ]; then
-              output="${output}.exe"
-            fi
-            echo "Building ${goos}/${goarch} -> ${output}"
-            (
-              if [ -n "$goarm" ]; then
-                export GOARM="$goarm"
-              fi
-              case "$goarch" in
-                mips|mipsle)
-                  if [ -n "$gomips" ]; then
-                    export GOMIPS="$gomips"
-                  fi
-                  ;;
-                mips64|mips64le)
-                  if [ -n "$gomips" ]; then
-                    export GOMIPS64="$gomips"
-                  fi
-                  ;;
-              esac
-              GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 \
-                go build -trimpath -ldflags="$LDFLAGS" -o "$output" ./cmd/cf-probe
-            )
-          }
+      - name: Build binary (cargo)
+        if: "!matrix.use_cross"
+        shell: bash
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          mkdir -p dist
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp target/${{ matrix.target }}/release/sma.exe dist/${{ matrix.asset_name }}
+          else
+            cp target/${{ matrix.target }}/release/sma dist/${{ matrix.asset_name }}
+          fi
 
-          build_one linux amd64 amd64
-          build_one linux arm64 arm64
-          build_one linux 386 386
-          build_one linux arm armv5 5
-          build_one linux arm armv6 6
-          build_one linux arm armv7 7
-          build_one linux loong64 loong64
-          build_one linux mipsle mipsle "" softfloat
-          build_one linux mips mips "" softfloat
-          build_one linux mips64le mips64le "" softfloat
-          build_one linux mips64 mips64 "" softfloat
-          build_one freebsd amd64 amd64
-          build_one freebsd arm64 arm64
-          build_one freebsd 386 386
-          build_one freebsd arm arm
-          build_one darwin amd64 amd64
-          build_one darwin arm64 arm64
-          build_one windows amd64 amd64
-          build_one windows arm64 arm64
-          build_one windows 386 386
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
 
-          sha256sum dist/* > dist/checksums.txt
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
-      - name: Upload assets
+      - name: Generate Checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Upload release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --repo "${{ github.repository }}" --clobber
-
+        run: |
+          TAG="${{ github.event.release.tag_name || github.ref_name }}"
+          gh release view "$TAG" --repo "${{ github.repository }}" || gh release create "$TAG" --title "$TAG" --generate-notes --repo "${{ github.repository }}"
+          gh release upload "$TAG" dist/* --repo "${{ github.repository }}" --clobber

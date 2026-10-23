@@ -9,7 +9,11 @@ komari-agent
 build/
 .gocache/
 .gomodcache/
+target/
+cf-probe
+cf-probe.exe
 dist/
+.idea/
 auto-discovery.json
 fake-agent-client.json
 net_static.json

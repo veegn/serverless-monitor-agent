@@ -1,4 +1,4 @@
-name: Validate Go
+name: Validate Rust
 
 on:
   workflow_call:
@@ -18,13 +18,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Vet
-        run: go vet ./...
-
-      - name: Test with race detector
-        run: go test -race ./...
+      - name: Test
+        run: cargo test
