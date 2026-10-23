@@ -210,8 +210,15 @@ pub fn dial_websocket(
     }
 
     if status_code != 101 {
+        let limit = resp_headers
+            .get("content-length")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+            .min(1024);
         let mut body = String::new();
-        let _ = reader.read_to_string(&mut body);
+        if limit > 0 {
+            let _ = reader.by_ref().take(limit).read_to_string(&mut body);
+        }
         return Err(WsError::Handshake {
             status_code,
             headers: resp_headers,
@@ -311,6 +318,9 @@ impl WebSocketConn {
     fn read_frame(&mut self) -> Result<(bool, u8, Vec<u8>), WsError> {
         let mut header = [0u8; 2];
         self.reader.read_exact(&mut header)?;
+
+        // Once the frame header has started, read the rest with a safe timeout
+        let _ = self.set_read_timeout(Some(Duration::from_secs(5)));
 
         let fin = header[0] & 0x80 != 0;
         let opcode = header[0] & 0x0F;

@@ -1,6 +1,6 @@
 [package]
 name = "serverless-monitor-agent"
-version = "1.0.0"
+version = "1.0.21"
 edition = "2021"
 authors = ["huilang-me"]
 description = "Serverless Monitor Agent"

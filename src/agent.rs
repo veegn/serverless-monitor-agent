@@ -22,7 +22,7 @@ use crate::traffic::{
     apply_traffic_correction_from_network, calc_monthly_traffic, parse_traffic_correction_gb,
 };
 use crate::transport::{
-    is_auth_config_http_status, is_wss_schedule_inactive_reason,
+    is_wss_schedule_inactive_reason,
     ReportTransport, TransportHost, AGENT_WSS_MODE_ACTIVE, AGENT_WSS_MODE_DISABLED,
     AGENT_WSS_MODE_HEADER, AGENT_WSS_MODE_INACTIVE, AGENT_WSS_REASON_HEADER, AGENT_WSS_SCHEDULE_INACTIVE,
 };
@@ -190,8 +190,6 @@ pub struct Agent {
     samples: Mutex<Vec<MetricSample>>,
     last_sample: Mutex<Option<Instant>>,
     last_report: Mutex<Option<Instant>>,
-    last_post: Mutex<Option<Instant>>,
-    last_post_attempt: Mutex<Option<Instant>>,
     last_config_state_report_at: Mutex<Option<Instant>>,
     last_config_state_report_md5: Mutex<String>,
     last_config_reject_key: Mutex<String>,
@@ -386,8 +384,6 @@ pub fn run(config_file: Option<&str>, debug: bool, version: &str) -> Result<(), 
         samples: Mutex::new(Vec::new()),
         last_sample: Mutex::new(None),
         last_report: Mutex::new(None),
-        last_post: Mutex::new(None),
-        last_post_attempt: Mutex::new(None),
         last_config_state_report_at: Mutex::new(None),
         last_config_state_report_md5: Mutex::new(String::new()),
         last_config_reject_key: Mutex::new(String::new()),
@@ -512,17 +508,11 @@ impl Agent {
                 return r.report_interval(fallback);
             }
         }
-        let report_interval = Duration::from_secs(cfg.report_interval as u64);
-        if report_interval < Duration::from_secs(1) {
-            Duration::from_secs(DEFAULT_REPORT_INTERVAL_SEC as u64)
-        } else {
-            report_interval
-        }
+        Duration::from_secs(DEFAULT_WSS_REPORT_INTERVAL_SEC as u64)
     }
 
-    fn persistent_uses_wss_config(&self, cfg: &Config) -> bool {
-        let mode = normalize_connection_mode(&cfg.connection_mode).unwrap_or_else(|_| CONNECTION_MODE_AUTO.to_string());
-        mode != CONNECTION_MODE_HTTP
+    fn persistent_uses_wss_config(&self, _cfg: &Config) -> bool {
+        true
     }
 
     fn wss_runtime_disabled(&self) -> (bool, String) {
@@ -575,11 +565,7 @@ impl Agent {
             return;
         }
 
-        let mut report_interval = Duration::from_secs(cfg.report_interval as u64);
-        if report_interval < Duration::from_secs(1) {
-            report_interval = Duration::from_secs(DEFAULT_REPORT_INTERVAL_SEC as u64);
-        }
-
+        let auto_discovery_due = cfg.server_id.is_empty();
         let wss_enabled = self.uses_wss_config(&cfg);
         let rep = self.reporter.lock().unwrap().clone();
         let wss_connected = wss_enabled && rep.as_ref().map(|r| r.connected()).unwrap_or(false);
@@ -589,27 +575,28 @@ impl Agent {
             && (last_report.is_none()
                 || now.duration_since(last_report.unwrap()) >= self.current_wss_report_interval_for_config(&cfg));
 
-        let last_post = *self.last_post.lock().unwrap();
-        let post_due = !wss_connected
-            && (last_post.is_none() || now.duration_since(last_post.unwrap()) >= report_interval);
-
-        let post_allowed = !wss_enabled || rep.is_none() || rep.as_ref().unwrap().post_fallback_allowed();
-        if post_due && !post_allowed && wss_enabled && rep.is_some() {
-            rep.as_ref().unwrap().log_post_fallback_delayed();
-        }
-
-        let should_post_report = post_due && post_allowed && self.post_attempt_allowed(now, report_interval);
-
         let collect_interval = effective_collect_interval(&cfg);
+        let sample_interval = if collect_interval > Duration::ZERO {
+            collect_interval
+        } else if !wss_connected && !auto_discovery_due {
+            Duration::from_secs(DEFAULT_WSS_REPORT_INTERVAL_SEC as u64)
+        } else {
+            Duration::ZERO
+        };
         let last_sample = *self.last_sample.lock().unwrap();
-        let should_sample = collect_interval > Duration::ZERO
-            && (last_sample.is_none() || now.duration_since(last_sample.unwrap()) >= collect_interval);
+        let should_sample = sample_interval > Duration::ZERO
+            && (last_sample.is_none() || now.duration_since(last_sample.unwrap()) >= sample_interval);
 
-        if !should_wss_report && !should_post_report && !should_sample {
+        if !should_wss_report && !auto_discovery_due && !should_sample {
             return;
         }
 
-        let report_due = should_wss_report || should_post_report;
+        let report_due = should_wss_report || auto_discovery_due;
+        let mut report_interval = Duration::from_secs(cfg.report_interval as u64);
+        if report_interval < Duration::from_secs(1) {
+            report_interval = Duration::from_secs(DEFAULT_REPORT_INTERVAL_SEC as u64);
+        }
+
         let mut full_at_guard = self.full_at.lock().unwrap();
         let full_due = report_due
             && (full_at_guard.is_none()
@@ -662,13 +649,26 @@ impl Agent {
 
         let m = self.build_metrics(&cfg, &cpu, net_now, rx_speed, tx_speed, rx_monthly, tx_monthly, disk_io);
 
+        if auto_discovery_due {
+            let report_at = Instant::now();
+            if let Ok((body, sample_count)) = self.build_report_body_for_config(&cfg, &m, report_at) {
+                let status_code = self.post_report_body(&cfg, &body, sample_count, false);
+                if (200..300).contains(&status_code) {
+                    self.persist_pending_server_id();
+                }
+            }
+            return;
+        }
+
         if should_sample {
             self.append_sample(now, &m);
         }
 
-        if should_wss_report || should_post_report {
-            let res = self.send_report(&cfg, &m, should_wss_report, should_post_report, report_interval);
+        if should_wss_report {
+            let res = self.send_report(&cfg, &m);
             self.apply_report_result(res, now, &cfg, &m);
+        } else if !wss_connected && should_sample {
+            self.record_offline_sample(now, &cfg);
         }
     }
 
@@ -821,9 +821,6 @@ impl Agent {
         &self,
         cfg: &Config,
         m: &Metrics,
-        prefer_wss: bool,
-        allow_post: bool,
-        report_interval: Duration,
     ) -> ReportSendResult {
         let report_at = Instant::now();
         let (body, sample_count) = match self.build_report_body_for_config(cfg, m, report_at) {
@@ -834,10 +831,8 @@ impl Agent {
             }
         };
 
-        let mut wss_failed = false;
         let rep = self.reporter.lock().unwrap().clone();
-        if prefer_wss && rep.is_some() {
-            let r = rep.as_ref().unwrap();
+        if let Some(r) = rep {
             self.log.debug(&format!(
                 "WSS report attempt url={} payload_bytes={} samples={}",
                 r.url(),
@@ -847,54 +842,11 @@ impl Agent {
             if r.send(&body) {
                 return ReportSendResult {
                     ok: true,
-                    via_wss: true,
-                    via_post: false,
                 };
             }
-            wss_failed = true;
         }
 
-        if !allow_post && !wss_failed {
-            return ReportSendResult::default();
-        }
-
-        if prefer_wss && rep.is_some() && !rep.as_ref().unwrap().post_fallback_allowed() {
-            rep.as_ref().unwrap().log_post_fallback_delayed();
-            return ReportSendResult::default();
-        }
-
-        if !self.post_attempt_allowed(report_at, report_interval) {
-            return ReportSendResult::default();
-        }
-
-        *self.last_post_attempt.lock().unwrap() = Some(report_at);
-        let status_code = self.post_report_body(cfg, &body, sample_count, prefer_wss);
-
-        if is_auth_config_http_status(status_code) && rep.is_some() {
-            rep.as_ref().unwrap().delay_protocol(&format!("POST fallback http={}", status_code));
-        }
-
-        if status_code < 200 || status_code >= 300 {
-            if status_code >= 400 {
-                self.note_report_failure(status_code);
-            }
-            return ReportSendResult::default();
-        }
-
-        self.note_report_success();
-        ReportSendResult {
-            ok: true,
-            via_wss: false,
-            via_post: true,
-        }
-    }
-
-    fn post_attempt_allowed(&self, now: Instant, report_interval: Duration) -> bool {
-        let last = *self.last_post_attempt.lock().unwrap();
-        match last {
-            Some(t) => now.duration_since(t) >= report_interval,
-            None => true,
-        }
+        ReportSendResult::default()
     }
 
     fn build_report_body_for_config(
@@ -1185,7 +1137,6 @@ impl Agent {
                 *self.cfg.write().unwrap() = next_cfg;
                 self.log.info("auto discovery created server successfully, please check dashboard after 2 minutes");
                 self.discovery_just_bound.store(true, AtomicOrdering::Relaxed);
-                *self.last_post_attempt.lock().unwrap() = None;
                 if let Some(r) = self.reporter.lock().unwrap().as_ref() {
                     r.reset_report_interval();
                 }
@@ -1260,12 +1211,7 @@ impl Agent {
         }
 
         if result.ok {
-            if result.via_wss {
-                *self.last_report.lock().unwrap() = Some(now);
-                *self.last_post.lock().unwrap() = Some(now);
-            } else if result.via_post {
-                *self.last_post.lock().unwrap() = Some(now);
-            }
+            *self.last_report.lock().unwrap() = Some(now);
             self.samples.lock().unwrap().clear();
             self.drain_cached_samples(cfg);
         } else {
@@ -1358,16 +1304,11 @@ impl Agent {
                 sent = rep.as_ref().unwrap().send(&body);
             }
 
-            if !sent {
-                let status = self.post_report_body(cfg, &body, batch_len, false);
-                sent = (200..300).contains(&status);
-            }
-
             if sent {
                 let _ = self.cache.lock().unwrap().drain(batch_len);
                 let remaining = self.cache.lock().unwrap().count();
                 self.log.info(&format!(
-                    "batch reported {} cached samples, remaining: {}",
+                    "batch reported {} cached samples via WSS, remaining: {}",
                     batch_len, remaining
                 ));
                 if remaining == 0 {
@@ -1574,8 +1515,6 @@ impl Agent {
             self.samples.lock().unwrap().clear();
             *self.last_sample.lock().unwrap() = None;
             *self.last_report.lock().unwrap() = None;
-            *self.last_post.lock().unwrap() = None;
-            *self.last_post_attempt.lock().unwrap() = None;
             *self.last_config_state_report_at.lock().unwrap() = None;
             *self.last_config_state_report_md5.lock().unwrap() = String::new();
 
@@ -1811,8 +1750,6 @@ impl Agent {
 #[derive(Debug, Clone, Copy, Default)]
 struct ReportSendResult {
     ok: bool,
-    via_wss: bool,
-    via_post: bool,
 }
 
 fn probe_history_key(ping_mode: &str, node: &str) -> String {

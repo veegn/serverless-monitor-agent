@@ -128,10 +128,8 @@ pub trait TransportHost: Send + Sync {
 
 struct Inner {
     ws_url: String,
-    conn: Option<WebSocketConn>,
     pause_until: Option<Instant>,
     pause_reason: String,
-    last_post_delay_log: Option<Instant>,
     last_config_at: Option<Instant>,
     next_report_after: Option<Duration>,
     running: bool,
@@ -142,6 +140,8 @@ struct Inner {
 pub struct ReportTransport {
     host: Arc<dyn TransportHost>,
     inner: Arc<Mutex<Inner>>,
+    conn: Arc<Mutex<Option<WebSocketConn>>>,
+    connected: Arc<AtomicBool>,
     wake_cv: Arc<Condvar>,
     shutdown: Arc<AtomicBool>,
 }
@@ -161,16 +161,16 @@ impl ReportTransport {
             host,
             inner: Arc::new(Mutex::new(Inner {
                 ws_url,
-                conn: None,
                 pause_until: None,
                 pause_reason: String::new(),
-                last_post_delay_log: None,
                 last_config_at: None,
                 next_report_after: None,
                 running: false,
                 stopped: false,
                 restart_requested: false,
             })),
+            conn: Arc::new(Mutex::new(None)),
+            connected: Arc::new(AtomicBool::new(false)),
             wake_cv: Arc::new(Condvar::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
         }
@@ -243,8 +243,12 @@ impl ReportTransport {
         inner.stopped = true;
         inner.pause_until = None;
         inner.pause_reason.clear();
-        let _ = inner.conn.take();
         drop(inner);
+
+        let mut guard = self.conn.lock().unwrap();
+        let _ = guard.take();
+        self.connected.store(false, AtomicOrdering::SeqCst);
+
         self.wake_cv.notify_all();
         if !reason.is_empty() {
             self.host.logger().info(&format!("WSS stopped reason={}", reason));
@@ -256,66 +260,30 @@ impl ReportTransport {
     }
 
     pub fn connected(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
-        if let Some(until) = inner.pause_until {
-            if Instant::now() < until {
-                return false;
-            }
-        }
-        inner.conn.is_some()
+        self.connected.load(AtomicOrdering::SeqCst)
     }
 
     pub fn send(&self, body: &[u8]) -> bool {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(until) = inner.pause_until {
-            if Instant::now() < until {
-                return false;
+        if !self.connected.load(AtomicOrdering::SeqCst) {
+            return false;
+        }
+        {
+            let inner = self.inner.lock().unwrap();
+            if let Some(until) = inner.pause_until {
+                if Instant::now() < until {
+                    return false;
+                }
             }
         }
-        if let Some(conn) = inner.conn.as_mut() {
+        let mut guard = self.conn.lock().unwrap();
+        if let Some(conn) = guard.as_mut() {
             if conn.write_text(body, WSS_WRITE_TIMEOUT).is_ok() {
                 return true;
             }
-            let _ = inner.conn.take();
+            let _ = guard.take();
+            self.connected.store(false, AtomicOrdering::SeqCst);
         }
         false
-    }
-
-    pub fn post_fallback_allowed(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
-        if let Some(until) = inner.pause_until {
-            Instant::now() >= until
-        } else {
-            true
-        }
-    }
-
-    pub fn log_post_fallback_delayed(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        let now = Instant::now();
-        let (delay, reason) = if let Some(until) = inner.pause_until {
-            if now < until {
-                (until.duration_since(now), inner.pause_reason.clone())
-            } else {
-                return;
-            }
-        } else {
-            return;
-        };
-
-        if let Some(last_log) = inner.last_post_delay_log {
-            if now.duration_since(last_log) < Duration::from_secs(30) {
-                return;
-            }
-        }
-        inner.last_post_delay_log = Some(now);
-        drop(inner);
-
-        self.host.logger().info(&format!(
-            "POST fallback delayed reason={} remaining={}s",
-            reason,
-            delay.as_secs()
-        ));
     }
 
     pub fn delay_protocol(&self, reason: &str) {
@@ -323,17 +291,14 @@ impl ReportTransport {
         let mut inner = self.inner.lock().unwrap();
         inner.pause_until = Some(Instant::now() + WSS_PROTOCOL_RETRY_DELAY);
         inner.pause_reason = r.to_string();
-        let _ = inner.conn.take();
-        inner.last_post_delay_log = Some(Instant::now());
         drop(inner);
+
+        let mut guard = self.conn.lock().unwrap();
+        let _ = guard.take();
+        self.connected.store(false, AtomicOrdering::SeqCst);
 
         self.host.logger().info(&format!(
             "WSS retry delayed reason={} delay={}s",
-            r,
-            WSS_PROTOCOL_RETRY_DELAY.as_secs()
-        ));
-        self.host.logger().info(&format!(
-            "POST fallback delayed reason={} delay={}s",
             r,
             WSS_PROTOCOL_RETRY_DELAY.as_secs()
         ));
@@ -418,24 +383,30 @@ impl ReportTransport {
             };
 
             {
-                let mut inner = self.inner.lock().unwrap();
+                let inner = self.inner.lock().unwrap();
                 if inner.stopped || !self.host.uses_wss() {
                     break;
                 }
-                inner.conn = Some(conn);
             }
+            {
+                let mut guard = self.conn.lock().unwrap();
+                *guard = Some(conn);
+            }
+            self.connected.store(true, AtomicOrdering::SeqCst);
 
             self.host.logger().info(&format!(
                 "WSS connected url={} protocol={} ts={}",
                 ws_url, hello.protocol, hello.ts
             ));
             self.host.note_report_success();
+            self.host.wake_tick();
 
             let err = self.read_loop();
             {
-                let mut inner = self.inner.lock().unwrap();
-                let _ = inner.conn.take();
+                let mut guard = self.conn.lock().unwrap();
+                let _ = guard.take();
             }
+            self.connected.store(false, AtomicOrdering::SeqCst);
             self.host.wake_tick();
 
             if let Some(err) = err {
@@ -496,22 +467,42 @@ impl ReportTransport {
     }
 
     fn read_loop(&self) -> Option<WsError> {
+        let mut last_activity = Instant::now();
+        let short_poll = Duration::from_millis(100);
+
         loop {
             if !self.should_run() {
                 return None;
             }
-            let timeout = self.read_idle_timeout();
+            let idle_timeout = self.read_idle_timeout();
+            if last_activity.elapsed() >= idle_timeout {
+                return Some(WsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "WSS idle timeout",
+                )));
+            }
 
-            let mut msg_res = None;
+            let msg_res;
             {
-                let mut inner = self.inner.lock().unwrap();
-                if let Some(conn) = inner.conn.as_mut() {
-                    let _ = conn.set_read_timeout(Some(timeout));
+                let mut guard = self.conn.lock().unwrap();
+                if let Some(conn) = guard.as_mut() {
+                    let _ = conn.set_read_timeout(Some(short_poll));
                     msg_res = Some(conn.read_data_message());
+                } else {
+                    return None;
                 }
             }
             let (payload, opcode) = match msg_res {
-                Some(Ok(res)) => res,
+                Some(Ok(res)) => {
+                    last_activity = Instant::now();
+                    res
+                }
+                Some(Err(WsError::Io(ref io_err)))
+                    if io_err.kind() == std::io::ErrorKind::TimedOut
+                        || io_err.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    continue;
+                }
                 Some(Err(err)) => return Some(err),
                 None => return None,
             };
@@ -733,6 +724,8 @@ impl Clone for ReportTransport {
         Self {
             host: self.host.clone(),
             inner: self.inner.clone(),
+            conn: self.conn.clone(),
+            connected: self.connected.clone(),
             wake_cv: self.wake_cv.clone(),
             shutdown: self.shutdown.clone(),
         }
