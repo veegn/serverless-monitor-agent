@@ -15,11 +15,11 @@
 │  │ (CPU/RAM/IO/Net) │           │ (metrics_cache)   │  │
 │  └────────┬─────────┘           └────────▲──────────┘  │
 │           │                              │             │
-│           ▼                              │ 故障写入    │
+│           ▼                              │ 离线暂存    │
 │  ┌───────────────────────────────────────┴──────────┐  │
-│  │ 双通道传输调度器 (Transport Manager)             │  │
-│  │  - 主通道: WebSocket (WSS) 长连接实时推送        │  │
-│  │  - 备用通道: HTTP POST 短连接兜底与批量补报       │  │
+│  │ 传输调度器 (Transport Manager)                   │  │
+│  │  - 实时推送与批量补报: WebSocket (WSS) 长连接    │  │
+│  │  - 服务发现自动注册: HTTP POST 短连接            │  │
 │  └──────────────────────┬───────────────────────────┘  │
 └─────────────────────────┼──────────────────────────────┘
                           │ TLS 加密通信
@@ -35,8 +35,8 @@
 
 ### 核心特性
 1. **服务发现式极简注册**：无需预先在后台手工创建节点获取 `SERVER_ID`。安装探针时只需提供服务端授权 Token，探针自动上报 VPS 完整硬件与系统画像，服务器名称默认取操作系统主机名（`hostname`），服务端校验 Token 后自动分配 ID 并返回。
-2. **通信故障本地缓存与批量补报**：当网络中断、服务端异常（5xx/超时/维护）时，探针自动将采样的指标落盘暂存到本地持久化缓存文件（`metrics_cache.dat`），探测到服务端恢复后，以批次形式（每批最多 50 条）自动将历史数据全量补报，保证监控曲线不中断、不丢点。
-3. **双通道容灾架构**：默认优先保持 WebSocket (WSS) 长连接以实现极低延迟与双向配置推送；当长连接受阻或服务端调度繁忙时，平滑降级为 HTTP POST 上报。
+2. **通信故障本地缓存与批量补报**：当网络中断、服务端异常（超时/断连）时，探针自动将采样的指标落盘暂存到本地持久化缓存文件（`metrics_cache.dat`），探测到服务端恢复连接后，以批次形式（每批最多 50 条）通过 WSS 自动将历史数据全量补报，保证监控曲线不中断、不丢点。
+3. **极简低开销架构**：日常监控统一采用 WebSocket (WSS) 全双工长连接通道，实现亚秒级极低延迟指标上报与服务端动态配置秒级推送；仅在未配 ID 的冷启动时使用 HTTP POST 进行一次性服务发现登记。
 
 ---
 
@@ -251,28 +251,21 @@ sequenceDiagram
     participant LocalDisk as 本地缓存 (metrics_cache.dat)
     participant Server as 服务端 (Worker / Backend)
 
-    Note over Agent: 正常周期采集指标
-    Agent->xServer: HTTP POST /update (超时 / 网络不可达 / 502 Bad Gateway)
-    Note over Agent: 探测到服务端不可用<br/>触发故障容灾机制
+    Note over Agent: 正常周期采集指标 (WSS 实时上报)
+    Agent->xServer: WSS 断开 / 发送失败 / 网络中断
+    Note over Agent: 探测到服务端不可用<br/>触发离线暂存机制
     Agent->>LocalDisk: 追加当前采样指标 (JSON Lines 格式)
-    Note over Agent: 进入指数退避周期 (120s -> 600s)<br/>后台采样继续累积写入本地缓存
+    Note over Agent: 进入退避重连周期 (60s -> 300s)<br/>后台采样继续累积写入本地磁盘缓存
     
-    Note over Agent: 下一重试周期到达
-    Agent->>Server: HTTP POST /update (当前最新指标)
-    alt 服务端恢复
-        Server-->>Agent: 200 OK
-        Note over Agent: 通信恢复！检测到本地存在待补报历史缓存
-        loop 批量补报分片 (每批最大 50 条，直到清空)
-            Agent->>LocalDisk: 读取最早的 50 条缓存记录
-            Agent->>Server: HTTP POST /update (batch: true, samples: [50项])
-            Server-->>Agent: 200 OK (服务端批量落库)
-            Agent->>LocalDisk: 裁剪移除已确认上报的 50 条记录
-        end
-        Note over Agent: 缓存清理完毕，恢复正常实时上报模式
-    else 服务端仍不可用
-        Server--xAgent: 失败
-        Note over Agent: 维持本地缓存并进一步阶梯退避
+    Note over Agent: WSS 重连成功
+    Agent->>Server: WSS 建立连接 (Hello / Ack 握手成功)
+    Note over Agent: 通信恢复！检测到本地存在待补报历史缓存
+    loop 批量补报分片 (每批最大 50 条，直到清空)
+        Agent->>LocalDisk: 读取最早的 50 条缓存记录
+        Agent->>Server: WSS Text Frame (batch: true, samples: [50项])
+        Agent->>LocalDisk: 裁剪移除已确认上报的 50 条记录
     end
+    Note over Agent: 缓存清理完毕，恢复正常实时上报模式
 ```
 
 ### 5.2 本地缓存文件格式

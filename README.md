@@ -53,7 +53,7 @@ Invoke-WebRequest -Uri "https://raw.githubusercontent.com/veegn/serverless-monit
 PowerShell -ExecutionPolicy Bypass -File $script install -token=TOKEN -url=WORKER_URL
 ```
 
-不传 `-id` 时，Agent 启动后只走 POST 上报：首次上报由服务端创建服务器并返回 ID，Agent 立即写入配置文件（`SERVER_ID`），随后按服务端下发的 `connection_mode` 决定是否切换到 WSS。建号成功的日志为「自动发现已创建服务器」，约 2 分钟后面板才会显示该服务器。若写入配置失败，ID 仍会在本次运行内生效，Agent 会在后续上报中持续重试写入；若始终写不进去，重启后会重新走建号流程——同名会中止退出，名称变化（例如公网 IP 改变）则会建出一台重复服务器，请及时修复配置目录权限。服务端已存在同名服务器（`reused`）、建号失败（`failed`），或服务端未开启自动发现（空 `id` 上报只收到普通 404）时，Agent 只输出一条提示便直接退出：既不复用同名服务器、也不重试，磁盘上不会留下任何标记文件；服务管理器的重启策略已改为仅在异常退出时重启，因此不会被自动拉起（`systemctl status sma` 显示为已停止）。修复后重新执行 `install` 并传入 `-id` 即可恢复。
+不传 `-id` 时，Agent 启动后首先通过 HTTP POST 完成服务发现注册：由服务端创建服务器并返回分配的 ID，Agent 立即写入配置文件（`SERVER_ID`），随后切换为 WSS 全双工长连接进行实时监控上报。建号成功的日志为「auto discovery created server successfully」，约 2 分钟后面板才会显示该服务器。若写入配置失败，ID 仍会在本次运行内生效，Agent 会在后续上报中持续重试写入；若始终写不进去，重启后会重新走建号流程——同名会中止退出，名称变化（例如公网 IP 改变）则会建出一台重复服务器，请及时修复配置目录权限。服务端已存在同名服务器（`reused`）、建号失败（`failed`），或服务端未开启自动发现（空 `id` 上报只收到普通 404）时，Agent 只输出一条提示便直接退出：既不复用同名服务器、也不重试，磁盘上不会留下任何标记文件；服务管理器的重启策略已改为仅在异常退出时重启，因此不会被自动拉起（`systemctl status sma` 显示为已停止）。修复后重新执行 `install` 并传入 `-id` 即可恢复。
 
 ## Windows 安装
 
@@ -98,7 +98,7 @@ curl -fsSL https://raw.githubusercontent.com/veegn/serverless-monitor-agent/main
 | `-bgp=HOST` | BGP 节点测试节点，可写 `host` 或 `host:port` | 空 |
 | `-interface=IFACES` | 指定统计网卡，多个用英文逗号分隔 | 自动汇总 |
 | `-reset_day=N` | 每月流量重置日，`1-31`；`0` 表示不重置 | `1` |
-| `-connection_mode=auto\|http` | 连接模式；`auto` 优先 WSS 实时上报并在不可用时 POST 兜底，`http` 仅按上报间隔 POST | `auto` |
+| `-connection_mode=auto\|http` | 连接模式；默认 `auto` 使用 WSS 实时上报（离线自动落盘并批量补报），保留兼容性选项 | `auto` |
 | `-ping_mode=tcp\|icmp` | Ping 探测模式；`tcp` 使用 TCP 连接探测，`icmp` 使用 ICMP 探测；两者均每 20 秒采样一次并按 2 分钟窗口聚合 | `tcp` |
 | `-auto_update=0\|1` | 是否开启自动检查更新 | `0` |
 | `-rx_correction=N` | 下行流量校正，单位 GB | 空 |
