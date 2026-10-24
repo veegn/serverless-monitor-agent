@@ -96,3 +96,25 @@ fn test_calibrated_clock_updates_date_beyond_threshold() {
     let snap = clock.snapshot(anchor_sys, anchor_mono);
     assert_eq!(snap.accurate_ts, Some(anchor_sys_ms + 25_000));
 }
+
+#[test]
+fn test_uncalibrated_clock_timestamp_preserves_relative_sample_age() {
+    let clock = CalibratedClock::default();
+    let now = Instant::now();
+    let sample1_mono = now - Duration::from_secs(5);
+    let sample2_mono = now - Duration::from_secs(2);
+    let sample3_mono = now;
+
+    let (ts1, ok1) = clock.timestamp(sample1_mono);
+    let (ts2, ok2) = clock.timestamp(sample2_mono);
+    let (ts3, ok3) = clock.timestamp(sample3_mono);
+
+    assert!(!ok1);
+    assert!(!ok2);
+    assert!(!ok3);
+
+    assert!(ts1 < ts2);
+    assert!(ts2 < ts3);
+    assert_eq!(ts2 - ts1, 3000);
+    assert_eq!(ts3 - ts2, 2000);
+}

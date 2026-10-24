@@ -145,6 +145,7 @@ impl Agent {
             let clk = self.clock.lock().unwrap();
             let mut to_cache = Vec::new();
             let mut mem_samples = self.samples.lock().unwrap();
+            let had_mem_samples = !mem_samples.is_empty();
             for s in mem_samples.drain(..) {
                 let (ts, _) = clk.timestamp(s.at);
                 to_cache.push(CachedSample {
@@ -152,11 +153,13 @@ impl Agent {
                     metrics: s.metrics,
                 });
             }
-            let (current_ts, _) = clk.timestamp(now);
-            to_cache.push(CachedSample {
-                ts: current_ts,
-                metrics: sample_metrics_to_map(m),
-            });
+            if !had_mem_samples {
+                let (current_ts, _) = clk.timestamp(now);
+                to_cache.push(CachedSample {
+                    ts: current_ts,
+                    metrics: sample_metrics_to_map(m),
+                });
+            }
             let added = cache_guard.append_samples(&to_cache).unwrap_or(0);
             let total = cache_guard.count();
             drop(cache_guard);
@@ -244,7 +247,7 @@ impl Agent {
                     self.log.info("all cached samples reported successfully");
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(100));
             } else {
                 self.log.warn("batch report delivery failed, will retry on next cycle");
                 break;

@@ -19,7 +19,7 @@ pub use schedule::{
     wss_schedule_inactive_from_headers, AGENT_WSS_MODE_ACTIVE, AGENT_WSS_MODE_DISABLED,
     AGENT_WSS_MODE_HEADER, AGENT_WSS_MODE_INACTIVE, AGENT_WSS_REASON_HEADER,
     AGENT_WSS_SCHEDULE_DISABLED, AGENT_WSS_SCHEDULE_EMPTY, AGENT_WSS_SCHEDULE_INACTIVE,
-    WSS_NETWORK_MAX_RETRY, WSS_NETWORK_MIN_RETRY, WSS_PROTOCOL_RETRY_DELAY,
+    WSS_FAST_RETRY_INTERVAL, WSS_NETWORK_MAX_RETRY, WSS_NETWORK_MIN_RETRY, WSS_PROTOCOL_RETRY_DELAY,
 };
 pub use url::{report_websocket_url, report_websocket_url_with_config};
 
@@ -36,8 +36,9 @@ use crate::util::log::Logger;
 pub const WSS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const WSS_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 pub const WSS_WRITE_TIMEOUT: Duration = Duration::from_secs(8);
-pub const WSS_READ_IDLE_GRACE: Duration = Duration::from_secs(15);
-pub const WSS_READ_IDLE_MIN: Duration = Duration::from_secs(15);
+pub const WSS_READ_IDLE_GRACE: Duration = Duration::from_secs(45);
+pub const WSS_READ_IDLE_MIN: Duration = Duration::from_secs(45);
+pub const WSS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 pub const WSS_CONFIG_MIN_INTERVAL: Duration = Duration::from_secs(60);
 pub const WSS_DYNAMIC_MIN_INTERVAL: Duration = Duration::from_secs(1);
 pub const WSS_DYNAMIC_MAX_INTERVAL: Duration = Duration::from_secs(300);
@@ -246,7 +247,7 @@ impl ReportTransport {
             return;
         }
 
-        let mut backoff = WSS_NETWORK_MIN_RETRY;
+        let mut backoff = WSS_FAST_RETRY_INTERVAL;
         loop {
             if !self.should_run() {
                 break;
@@ -285,7 +286,11 @@ impl ReportTransport {
                     if !self.wait_network_retry(&err.to_string(), backoff) {
                         break;
                     }
-                    backoff = next_wss_backoff(backoff);
+                    backoff = if backoff < WSS_NETWORK_MIN_RETRY {
+                        WSS_NETWORK_MIN_RETRY
+                    } else {
+                        next_wss_backoff(backoff)
+                    };
                     continue;
                 }
             };
@@ -293,7 +298,7 @@ impl ReportTransport {
             if !self.should_run() {
                 break;
             }
-            backoff = WSS_NETWORK_MIN_RETRY;
+            backoff = WSS_FAST_RETRY_INTERVAL;
 
             if let Some(date) = headers.get("date") {
                 let rtt = received.duration_since(started);
@@ -339,6 +344,7 @@ impl ReportTransport {
             self.host.wake_tick();
 
             if let Some(err) = err {
+                backoff = WSS_FAST_RETRY_INTERVAL;
                 if self.handle_connection_error(&err, &mut backoff) {
                     continue;
                 }
@@ -397,18 +403,42 @@ impl ReportTransport {
 
     fn read_loop(&self) -> Option<WsError> {
         let mut last_activity = Instant::now();
+        let mut last_ping = Instant::now();
         let short_poll = Duration::from_millis(100);
 
         loop {
             if !self.should_run() {
                 return None;
             }
+
+            // Sync connection-level activity (e.g. Ping/Pong/Data frames received)
+            {
+                let guard = self.conn.lock().unwrap();
+                if let Some(ref conn) = *guard {
+                    let conn_act = conn.last_activity();
+                    if conn_act > last_activity {
+                        last_activity = conn_act;
+                    }
+                }
+            }
+
             let idle_timeout = self.read_idle_timeout();
             if last_activity.elapsed() >= idle_timeout {
                 return Some(WsError::Io(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "WSS idle timeout",
                 )));
+            }
+
+            // Cloudflare Worker keep-alive heartbeat: send ping every 25s
+            if last_ping.elapsed() >= WSS_HEARTBEAT_INTERVAL {
+                let mut guard = self.conn.lock().unwrap();
+                if let Some(ref mut conn) = *guard {
+                    if let Err(e) = conn.write_ping(b"", Duration::from_secs(4)) {
+                        return Some(e);
+                    }
+                }
+                last_ping = Instant::now();
             }
 
             let msg_res = {
@@ -582,8 +612,8 @@ impl ReportTransport {
     }
 
     fn wait_network_retry(&self, err_msg: &str, delay: Duration) -> bool {
-        let d = if delay < WSS_NETWORK_MIN_RETRY {
-            WSS_NETWORK_MIN_RETRY
+        let d = if delay < WSS_FAST_RETRY_INTERVAL {
+            WSS_FAST_RETRY_INTERVAL
         } else {
             delay
         };
@@ -625,7 +655,11 @@ impl ReportTransport {
         if !self.wait_network_retry(&err.to_string(), delay) {
             return false;
         }
-        *backoff = next_wss_backoff(delay);
+        *backoff = if delay < WSS_NETWORK_MIN_RETRY {
+            WSS_NETWORK_MIN_RETRY
+        } else {
+            next_wss_backoff(delay)
+        };
         true
     }
 

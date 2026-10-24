@@ -104,6 +104,7 @@ impl Write for WsUnderlyingStream {
 pub struct WebSocketConn {
     reader: BufReader<WsUnderlyingStream>,
     write_mu: Mutex<()>,
+    last_activity: Instant,
 }
 
 pub fn dial_websocket(
@@ -243,6 +244,7 @@ pub fn dial_websocket(
         WebSocketConn {
             reader,
             write_mu: Mutex::new(()),
+            last_activity: Instant::now(),
         },
         resp_headers,
         started,
@@ -251,6 +253,10 @@ pub fn dial_websocket(
 }
 
 impl WebSocketConn {
+    pub fn last_activity(&self) -> Instant {
+        self.last_activity
+    }
+
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
         match self.reader.get_ref() {
             WsUnderlyingStream::Plain(s) => s.set_read_timeout(timeout),
@@ -269,12 +275,17 @@ impl WebSocketConn {
         self.write_frame(WS_OPCODE_TEXT, payload, timeout)
     }
 
+    pub fn write_ping(&mut self, payload: &[u8], timeout: Duration) -> Result<(), WsError> {
+        self.write_frame(WS_OPCODE_PING, payload, timeout)
+    }
+
     pub fn read_data_message(&mut self) -> Result<(Vec<u8>, u8), WsError> {
         let mut message = Vec::new();
         let mut message_opcode = 0u8;
 
         loop {
             let (fin, opcode, payload) = self.read_frame()?;
+            self.last_activity = Instant::now();
             match opcode {
                 WS_OPCODE_PING => {
                     let _ = self.write_frame(WS_OPCODE_PONG, &payload, Duration::from_secs(8));

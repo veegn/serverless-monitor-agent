@@ -6,7 +6,7 @@ use crate::metrics::{
 };
 use crate::platform::native_arch;
 use crate::storage::cache::CachedSample;
-use crate::types::{Config, DiskIOStats, Metrics, NetBytes};
+use crate::types::{Config, DiskIOStats, Metrics, NetBytes, MAX_BUFFERED_METRIC_SAMPLES};
 
 use super::probe_worker::{probe_loss_value, probe_rtt_value};
 use super::{Agent, MetricSample};
@@ -159,8 +159,8 @@ impl Agent {
             at: now,
             metrics: sample_metrics_to_map(m),
         });
-        if samples.len() > 60 {
-            let excess = samples.len() - 60;
+        if samples.len() > MAX_BUFFERED_METRIC_SAMPLES {
+            let excess = samples.len() - MAX_BUFFERED_METRIC_SAMPLES;
             samples.drain(0..excess);
         }
         *self.last_sample.lock().unwrap() = Some(now);

@@ -6,6 +6,7 @@ use std::time::Duration;
 use super::frames::WsServerFrame;
 
 pub const WSS_PROTOCOL_RETRY_DELAY: Duration = Duration::from_secs(120);
+pub const WSS_FAST_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 pub const WSS_NETWORK_MIN_RETRY: Duration = Duration::from_secs(60);
 pub const WSS_NETWORK_MAX_RETRY: Duration = Duration::from_secs(300);
 

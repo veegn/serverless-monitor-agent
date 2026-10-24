@@ -98,9 +98,14 @@ impl Agent {
         let cfg = self.config_snapshot();
         if self.report_pause_remaining(now) > Duration::ZERO {
             let collect_interval = effective_collect_interval(&cfg);
+            let sample_interval = if collect_interval > Duration::ZERO {
+                collect_interval
+            } else {
+                Duration::from_secs(DEFAULT_WSS_REPORT_INTERVAL_SEC)
+            };
             let last_sample = *self.last_sample.lock().unwrap();
-            let should_sample = collect_interval > Duration::ZERO
-                && (last_sample.is_none() || now.duration_since(last_sample.unwrap()) >= collect_interval);
+            let should_sample =
+                last_sample.is_none() || now.duration_since(last_sample.unwrap()) >= sample_interval;
 
             if should_sample {
                 self.record_offline_sample(now, &cfg);
@@ -204,14 +209,16 @@ impl Agent {
         }
 
         if should_sample {
-            self.append_sample(now, &m);
+            if wss_connected {
+                self.append_sample(now, &m);
+            } else {
+                self.record_offline_sample(now, &cfg);
+            }
         }
 
         if should_wss_report {
             let res = self.send_report(&cfg, &m);
             self.apply_report_result(res, now, &cfg, &m);
-        } else if !wss_connected && should_sample {
-            self.record_offline_sample(now, &cfg);
         }
     }
 }

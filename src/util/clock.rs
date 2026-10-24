@@ -95,7 +95,19 @@ impl CalibratedClock {
                 return (cal.timestamp(mono), true);
             }
         }
-        (SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0), false)
+        let now_mono = Instant::now();
+        let now_sys = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let ts = if mono <= now_mono {
+            let elapsed_ms = now_mono.duration_since(mono).as_millis() as i64;
+            saturating_subtract(now_sys, elapsed_ms)
+        } else {
+            let future_ms = mono.duration_since(now_mono).as_millis() as i64;
+            saturating_add(now_sys, future_ms)
+        };
+        (ts, false)
     }
 
     pub fn correct_local_timestamp(&self, local_ts: i64, observed_mono: Instant, observed_sys: SystemTime) -> i64 {

@@ -1,6 +1,7 @@
 use serverless_monitor_agent::transport::{
     is_auth_config_http_status, is_wss_schedule_inactive_reason, next_wss_backoff,
     report_websocket_url, report_websocket_url_with_config, wss_config_payload,
+    WSS_FAST_RETRY_INTERVAL,
 };
 use serverless_monitor_agent::types::Config;
 use std::sync::Arc;
@@ -48,6 +49,11 @@ fn test_next_wss_backoff_starts_at_sixty_seconds() {
         next_wss_backoff(Duration::from_secs(60)),
         Duration::from_secs(120)
     );
+}
+
+#[test]
+fn test_wss_fast_retry_interval_is_two_seconds() {
+    assert_eq!(WSS_FAST_RETRY_INTERVAL, Duration::from_secs(2));
 }
 
 #[test]

@@ -208,7 +208,6 @@ impl Agent {
             *self.monthly_rx.lock().unwrap() = 0;
             *self.monthly_tx.lock().unwrap() = 0;
             *self.full_at.lock().unwrap() = None;
-            self.samples.lock().unwrap().clear();
             *self.last_sample.lock().unwrap() = None;
             *self.last_report.lock().unwrap() = None;
             *self.last_config_state_report_at.lock().unwrap() = None;
