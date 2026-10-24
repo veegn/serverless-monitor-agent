@@ -1,7 +1,7 @@
 use serverless_monitor_agent::transport::{
     is_auth_config_http_status, is_wss_schedule_inactive_reason, next_wss_backoff,
-    report_websocket_url, report_websocket_url_with_config, wss_config_payload,
-    WSS_FAST_RETRY_INTERVAL,
+    next_wss_reconnect_backoff, report_websocket_url, report_websocket_url_with_config,
+    wss_config_payload, WSS_FAST_RETRY_INTERVAL,
 };
 use serverless_monitor_agent::types::Config;
 use std::sync::Arc;
@@ -54,6 +54,19 @@ fn test_next_wss_backoff_starts_at_sixty_seconds() {
 #[test]
 fn test_wss_fast_retry_interval_is_two_seconds() {
     assert_eq!(WSS_FAST_RETRY_INTERVAL, Duration::from_secs(2));
+}
+
+#[test]
+fn test_next_wss_reconnect_backoff_ladder() {
+    assert_eq!(next_wss_reconnect_backoff(Duration::from_secs(1)), Duration::from_secs(2));
+    assert_eq!(next_wss_reconnect_backoff(Duration::from_secs(2)), Duration::from_secs(4));
+    assert_eq!(next_wss_reconnect_backoff(Duration::from_secs(4)), Duration::from_secs(8));
+    assert_eq!(next_wss_reconnect_backoff(Duration::from_secs(8)), Duration::from_secs(16));
+    assert_eq!(next_wss_reconnect_backoff(Duration::from_secs(16)), Duration::from_secs(30));
+    assert_eq!(next_wss_reconnect_backoff(Duration::from_secs(30)), Duration::from_secs(60));
+    assert_eq!(next_wss_reconnect_backoff(Duration::from_secs(60)), Duration::from_secs(120));
+    assert_eq!(next_wss_reconnect_backoff(Duration::from_secs(120)), Duration::from_secs(240));
+    assert_eq!(next_wss_reconnect_backoff(Duration::from_secs(240)), Duration::from_secs(300));
 }
 
 #[test]

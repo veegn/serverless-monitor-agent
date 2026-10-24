@@ -86,3 +86,27 @@ pub fn next_wss_backoff(current: Duration) -> Duration {
         next
     }
 }
+
+/// Smooth exponential backoff ladder for WebSocket reconnects:
+/// 2s -> 4s -> 8s -> 16s -> 30s -> 60s -> 120s -> 240s -> 300s
+pub fn next_wss_reconnect_backoff(current: Duration) -> Duration {
+    if current < Duration::from_secs(2) {
+        Duration::from_secs(2)
+    } else if current < Duration::from_secs(4) {
+        Duration::from_secs(4)
+    } else if current < Duration::from_secs(8) {
+        Duration::from_secs(8)
+    } else if current < Duration::from_secs(16) {
+        Duration::from_secs(16)
+    } else if current < Duration::from_secs(30) {
+        Duration::from_secs(30)
+    } else if current < Duration::from_secs(60) {
+        Duration::from_secs(60)
+    } else if current < Duration::from_secs(120) {
+        Duration::from_secs(120)
+    } else if current < Duration::from_secs(240) {
+        Duration::from_secs(240)
+    } else {
+        WSS_NETWORK_MAX_RETRY
+    }
+}

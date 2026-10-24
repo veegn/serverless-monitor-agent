@@ -31,6 +31,17 @@ impl Agent {
 
     pub(super) fn tick_interval(&self) -> Duration {
         let cfg = self.config_snapshot();
+        let rep = self.reporter.lock().unwrap().clone();
+        let wss_connected =
+            self.uses_wss_config(&cfg) && rep.as_ref().map(|r| r.connected()).unwrap_or(false);
+        if !wss_connected {
+            let collect = effective_collect_interval(&cfg);
+            if collect > Duration::ZERO {
+                return collect;
+            }
+            return Duration::from_secs(DEFAULT_WSS_REPORT_INTERVAL_SEC);
+        }
+
         let mut active = self.current_wss_report_interval_for_config(&cfg);
         let collect = effective_collect_interval(&cfg);
         if collect > Duration::ZERO {
@@ -59,9 +70,16 @@ impl Agent {
     }
 
     pub(super) fn wss_runtime_disabled(&self) -> (bool, String) {
-        let disabled_at = self.wss_runtime_disabled_at.lock().unwrap();
+        let mut disabled_at = self.wss_runtime_disabled_at.lock().unwrap();
         let reason = self.wss_runtime_disabled_reason.lock().unwrap();
-        (disabled_at.is_some(), reason.clone())
+        if let Some(at) = *disabled_at {
+            if at.elapsed() >= Duration::from_secs(60) {
+                *disabled_at = None;
+                return (false, String::new());
+            }
+            return (true, reason.clone());
+        }
+        (false, String::new())
     }
 
     pub(super) fn uses_wss(&self) -> bool {
@@ -96,7 +114,17 @@ impl Agent {
         }
 
         let cfg = self.config_snapshot();
-        if self.report_pause_remaining(now) > Duration::ZERO {
+        let auto_discovery_due = cfg.server_id.is_empty();
+        let wss_enabled = self.uses_wss_config(&cfg);
+        let rep = self.reporter.lock().unwrap().clone();
+        let wss_connected = wss_enabled && rep.as_ref().map(|r| r.connected()).unwrap_or(false);
+
+        let pause_remaining = self.report_pause_remaining(now);
+        if pause_remaining > Duration::ZERO && !wss_connected {
+            self.log.warn_once("report-paused-circuit", &format!(
+                "report paused due to failure circuit breaker (remaining: {}s), buffering offline samples",
+                pause_remaining.as_secs()
+            ));
             let collect_interval = effective_collect_interval(&cfg);
             let sample_interval = if collect_interval > Duration::ZERO {
                 collect_interval
@@ -112,11 +140,6 @@ impl Agent {
             }
             return;
         }
-
-        let auto_discovery_due = cfg.server_id.is_empty();
-        let wss_enabled = self.uses_wss_config(&cfg);
-        let rep = self.reporter.lock().unwrap().clone();
-        let wss_connected = wss_enabled && rep.as_ref().map(|r| r.connected()).unwrap_or(false);
 
         let last_report = *self.last_report.lock().unwrap();
         let should_wss_report = wss_connected

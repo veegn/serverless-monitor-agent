@@ -15,11 +15,12 @@ pub use frames::{
 };
 pub use schedule::{
     is_auth_config_http_status, is_wss_schedule_inactive_reason, next_wss_backoff,
-    wss_schedule_inactive_from_frame, wss_schedule_inactive_from_handshake,
-    wss_schedule_inactive_from_headers, AGENT_WSS_MODE_ACTIVE, AGENT_WSS_MODE_DISABLED,
-    AGENT_WSS_MODE_HEADER, AGENT_WSS_MODE_INACTIVE, AGENT_WSS_REASON_HEADER,
-    AGENT_WSS_SCHEDULE_DISABLED, AGENT_WSS_SCHEDULE_EMPTY, AGENT_WSS_SCHEDULE_INACTIVE,
-    WSS_FAST_RETRY_INTERVAL, WSS_NETWORK_MAX_RETRY, WSS_NETWORK_MIN_RETRY, WSS_PROTOCOL_RETRY_DELAY,
+    next_wss_reconnect_backoff, wss_schedule_inactive_from_frame,
+    wss_schedule_inactive_from_handshake, wss_schedule_inactive_from_headers,
+    AGENT_WSS_MODE_ACTIVE, AGENT_WSS_MODE_DISABLED, AGENT_WSS_MODE_HEADER,
+    AGENT_WSS_MODE_INACTIVE, AGENT_WSS_REASON_HEADER, AGENT_WSS_SCHEDULE_DISABLED,
+    AGENT_WSS_SCHEDULE_EMPTY, AGENT_WSS_SCHEDULE_INACTIVE, WSS_FAST_RETRY_INTERVAL,
+    WSS_NETWORK_MAX_RETRY, WSS_NETWORK_MIN_RETRY, WSS_PROTOCOL_RETRY_DELAY,
 };
 pub use url::{report_websocket_url, report_websocket_url_with_config};
 
@@ -114,6 +115,10 @@ impl ReportTransport {
         self.inner.lock().unwrap().next_report_after.unwrap_or(fallback)
     }
 
+    pub fn report_interval_peek(&self, fallback: Duration) -> Duration {
+        self.inner.lock().unwrap().next_report_after.unwrap_or(fallback)
+    }
+
     pub fn set_next_report_after_ms(&self, ms: i64) {
         if ms <= 0 {
             return;
@@ -130,6 +135,11 @@ impl ReportTransport {
         inner.next_report_after = Some(next);
         let should_wake = previous.is_none() || Some(next) < previous;
         drop(inner);
+
+        self.host.logger().info(&format!(
+            "WSS dynamic report interval received from server: {}ms (next report delay)",
+            next.as_millis()
+        ));
 
         if should_wake {
             self.host.wake_tick();
@@ -272,25 +282,29 @@ impl ReportTransport {
                     } = &err
                     {
                         if let Some(reason) = wss_schedule_inactive_from_handshake(*status_code, headers, body) {
-                            self.host.disable_wss_runtime(&reason);
-                            backoff = WSS_NETWORK_MIN_RETRY;
+                            let delay = std::cmp::max(backoff, Duration::from_secs(30));
+                            self.host.logger().warn(&format!(
+                                "WSS schedule inactive on server (status 409 reason={}), backing off for {}s before retry",
+                                reason,
+                                delay.as_secs()
+                            ));
+                            if !self.wait_network_retry(&format!("schedule_inactive: {}", reason), delay) {
+                                break;
+                            }
+                            backoff = next_wss_reconnect_backoff(delay);
                             continue;
                         }
                         if is_auth_config_http_status(*status_code as i32) {
                             self.host.note_report_failure(*status_code as i32);
                             self.delay_protocol(&format!("WSS handshake http={}", status_code));
-                            backoff = WSS_NETWORK_MIN_RETRY;
+                            backoff = std::cmp::max(backoff, WSS_PROTOCOL_RETRY_DELAY);
                             continue;
                         }
                     }
                     if !self.wait_network_retry(&err.to_string(), backoff) {
                         break;
                     }
-                    backoff = if backoff < WSS_NETWORK_MIN_RETRY {
-                        WSS_NETWORK_MIN_RETRY
-                    } else {
-                        next_wss_backoff(backoff)
-                    };
+                    backoff = next_wss_reconnect_backoff(backoff);
                     continue;
                 }
             };
@@ -309,10 +323,18 @@ impl ReportTransport {
             let hello = match self.wait_hello(&mut conn) {
                 Ok(h) => h,
                 Err(err) => {
+                    self.host.logger().warn(&format!(
+                        "WSS wait_hello failed (error: {}), backing off in {}s",
+                        err,
+                        backoff.as_secs()
+                    ));
                     if self.handle_connection_error(&err, &mut backoff) {
                         continue;
                     }
-                    break;
+                    if !self.should_run() {
+                        break;
+                    }
+                    continue;
                 }
             };
 
@@ -332,6 +354,7 @@ impl ReportTransport {
                 "WSS connected url={} protocol={} ts={}",
                 ws_url, hello.protocol, hello.ts
             ));
+            self.reset_report_interval();
             self.host.note_report_success();
             self.host.wake_tick();
 
@@ -343,13 +366,32 @@ impl ReportTransport {
             self.connected.store(false, AtomicOrdering::SeqCst);
             self.host.wake_tick();
 
-            if let Some(err) = err {
-                backoff = WSS_FAST_RETRY_INTERVAL;
-                if self.handle_connection_error(&err, &mut backoff) {
-                    continue;
-                }
+            if !self.should_run() {
+                self.host.logger().info("WSS transport stopped per lifecycle request");
+                break;
             }
-            break;
+
+            let effective_err = err.unwrap_or_else(|| {
+                WsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "connection dropped unexpectedly",
+                ))
+            });
+
+            backoff = WSS_FAST_RETRY_INTERVAL;
+            self.host.logger().warn(&format!(
+                "WSS connection dropped (reason: {}), entering fast reconnect in {}s",
+                effective_err,
+                backoff.as_secs()
+            ));
+
+            if self.handle_connection_error(&effective_err, &mut backoff) {
+                continue;
+            }
+            if !self.should_run() {
+                break;
+            }
+            continue;
         }
 
         let mut inner = self.inner.lock().unwrap();
@@ -443,7 +485,15 @@ impl ReportTransport {
 
             let msg_res = {
                 let mut guard = self.conn.lock().unwrap();
-                let conn = guard.as_mut()?;
+                let conn = match guard.as_mut() {
+                    Some(c) => c,
+                    None => {
+                        return Some(WsError::Io(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionAborted,
+                            "connection closed by concurrent writer",
+                        )));
+                    }
+                };
                 let _ = conn.set_read_timeout(Some(short_poll));
                 conn.read_data_message()
             };
@@ -456,6 +506,7 @@ impl ReportTransport {
                     if io_err.kind() == std::io::ErrorKind::TimedOut
                         || io_err.kind() == std::io::ErrorKind::WouldBlock =>
                 {
+                    std::thread::yield_now();
                     continue;
                 }
                 Err(err) => return Some(err),
@@ -504,12 +555,11 @@ impl ReportTransport {
                         &frame.error
                     };
                     if let Some(schedule_reason) = wss_schedule_inactive_from_frame(&frame) {
-                        self.host.logger().info(&format!(
-                            "WSS unavailable ts={} reason={}",
+                        self.host.logger().warn(&format!(
+                            "WSS received schedule inactive frame ts={} reason={}, initiating protocol backoff",
                             frame.ts, schedule_reason
                         ));
-                        self.host.disable_wss_runtime(&schedule_reason);
-                        return None;
+                        return Some(WsError::Protocol(format!("schedule_inactive: {}", schedule_reason)));
                     }
                     self.host.logger().error_once(
                         &format!("wss-server-err-{}", frame.code),
@@ -541,7 +591,7 @@ impl ReportTransport {
     }
 
     fn read_idle_timeout(&self) -> Duration {
-        let interval = self.report_interval(Duration::from_secs(DEFAULT_WSS_REPORT_INTERVAL_SEC));
+        let interval = self.report_interval_peek(Duration::from_secs(DEFAULT_WSS_REPORT_INTERVAL_SEC));
         let timeout = interval + WSS_READ_IDLE_GRACE;
         if timeout < WSS_READ_IDLE_MIN {
             WSS_READ_IDLE_MIN
@@ -617,34 +667,53 @@ impl ReportTransport {
         } else {
             delay
         };
-        self.host.logger().error_once(&format!("wss-retry-{}", err_msg), &format!(
-            "WSS connection failed, retrying reason={} delay={}s",
-            err_msg,
-            d.as_secs()
+        self.host.logger().warn(&format!(
+            "WSS connection retry backoff triggered: delay={}s reason={}",
+            d.as_secs(),
+            err_msg
         ));
         self.sleep(d)
     }
 
     fn handle_connection_error(&self, err: &WsError, backoff: &mut Duration) -> bool {
         if let WsError::Close { code, reason } = err {
-            if *code == 1013 && is_wss_schedule_inactive_reason(reason) {
-                self.host.logger().info(&format!("WSS unavailable close reason={}", reason));
-                self.host.disable_wss_runtime(reason);
-                return false;
+            if *code == 1013 {
+                let r = format!("WSS close code=1013 (Try Again Later) reason={}", reason);
+                let delay = std::cmp::max(*backoff, Duration::from_secs(15));
+                self.host.logger().warn(&format!(
+                    "{}, backing off for {}s before reconnect",
+                    r,
+                    delay.as_secs()
+                ));
+                if !self.wait_network_retry(&r, delay) {
+                    return false;
+                }
+                *backoff = next_wss_reconnect_backoff(delay);
+                return true;
             }
             if *code == 1008 {
                 self.host.note_report_failure(*code as i32);
-                let r = format!("WSS close code=1008 reason={}", reason);
-                self.host.logger().error_once("wss-close-1008", &format!("WSS auth/protocol error: {}", r));
+                let r = format!("WSS close code=1008 (Auth/Policy Violation) reason={}", reason);
+                self.host.logger().warn(&format!("WSS protocol error: {}", r));
                 self.delay_protocol(&r);
-                *backoff = WSS_NETWORK_MIN_RETRY;
+                *backoff = WSS_PROTOCOL_RETRY_DELAY;
                 return true;
             }
         }
         if let WsError::Protocol(msg) = err {
-            if msg.starts_with("server error code=") {
+            if msg.starts_with("server error code=") || msg.starts_with("schedule_inactive:") {
+                let delay = if msg.starts_with("schedule_inactive:") {
+                    Duration::from_secs(30)
+                } else {
+                    WSS_PROTOCOL_RETRY_DELAY
+                };
+                self.host.logger().warn(&format!(
+                    "WSS protocol backoff triggered: delay={}s error={}",
+                    delay.as_secs(),
+                    msg
+                ));
                 self.delay_protocol(msg);
-                *backoff = WSS_NETWORK_MIN_RETRY;
+                *backoff = delay;
                 return true;
             }
         }
@@ -655,11 +724,7 @@ impl ReportTransport {
         if !self.wait_network_retry(&err.to_string(), delay) {
             return false;
         }
-        *backoff = if delay < WSS_NETWORK_MIN_RETRY {
-            WSS_NETWORK_MIN_RETRY
-        } else {
-            next_wss_backoff(delay)
-        };
+        *backoff = next_wss_reconnect_backoff(delay);
         true
     }
 
