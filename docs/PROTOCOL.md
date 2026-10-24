@@ -156,7 +156,7 @@ sequenceDiagram
 
 ## 4. 常规指标上报协议 (Regular Metrics Reporting)
 
-建号成功后，探针按配置的 `report_interval`（默认 60 秒）周期性上报性能指标。
+建号成功后，HTTP/旧版路径按配置的 `report_interval`（默认 60 秒）上报。`connection_mode: auto` 的 WSS 自适应模式按专题规范中的 `realtimeHint` 与 `nextWssReportAfterMs` 调度；专题规范优先于本节的旧版周期描述。
 
 ### 4.1 上报请求报文
 ```json
@@ -256,7 +256,7 @@ sequenceDiagram
     Note over Agent: 探测到服务端不可用<br/>触发离线暂存机制
     Agent->>LocalDisk: 追加当前采样指标 (JSON Lines 格式)
     Note over Agent: 进入退避重连周期 (60s -> 300s)<br/>后台采样继续累积写入本地磁盘缓存
-    
+
     Note over Agent: WSS 重连成功
     Agent->>Server: WSS 建立连接 (Hello / Ack 握手成功)
     Note over Agent: 通信恢复！检测到本地存在待补报历史缓存
@@ -276,7 +276,7 @@ sequenceDiagram
 {"ts":1729700060000,"metrics":{"cpu":"15.20","ram_total":"8192","ram_used":"1600","swap_total":"2048","swap_used":"0","net_in_speed":"45000","net_out_speed":"32000"}}
 ```
 - **容量上限与淘汰策略**：
-  - 默认最多保留 `5000` 条采样记录（按 60 秒一次采样计算，可无损抵御超过 **3.5 天** 的离线断网）。
+  - 默认最多保留 `5000` 条采样记录。可保留时长取决于实际采样间隔：60 秒一条约 3.47 天；自适应模式按 2 秒一条采样时约 2.78 小时。部署方应按所需离线恢复时长配置缓存容量。
   - 超过上限后采用先进先出（FIFO）自动淘汰最老数据，保证宿主机磁盘安全。
 
 ### 5.3 批量补报报文 (Batch Report Payload)
@@ -286,6 +286,7 @@ sequenceDiagram
 {
   "id": "srv-us-east-01",
   "secret": "YOUR_AUTH_TOKEN",
+  "reportId": "srv-us-east-01-00000042",
   "batch": true,
   "time": {
     "local_ts": 1729703660000,
@@ -321,7 +322,7 @@ sequenceDiagram
 }
 ```
 
-- 服务端接收并处理后返回 `200 OK`，Agent 确认后同步剔除本地缓存中对应的已上报条目；若补报过程中断，未确认的条目依然保留在磁盘中。
+- HTTP 补报以 2xx 响应确认；WSS 补报以专题规范中的 `ackFor:"report"`、匹配的 `reportId`、`persisted:true` 和完整 `acceptedSamples` 确认。Agent 只删除已确认条目；若补报过程中断，未确认条目依然保留在磁盘中。服务端对重复 `reportId` 必须幂等。
 
 ---
 
@@ -334,28 +335,36 @@ WSS URL 附带版本与配置校验参数：
 `wss://example.com/update?config_schema=1&config_md5=c4ca4238a0b923820dcc509a6f75849b`
 
 ### 6.2 协议交互帧
+> 💡 **自适应动态上报技术规范**：关于无访客时低频批量（60s）节能上报、有访客时毫秒级提速（2s）实时推流的双模调度架构与 Cloudflare WebSocket Hibernation 详细实现，请参阅专题文档：[ADAPTIVE_REPORTING_SPEC.md](ADAPTIVE_REPORTING_SPEC.md)。
+
 1. **服务端 Hello 帧**：
-   Agent 连上后，服务端首帧必须返回 `hello`：
+   Agent 连上后，服务端首帧必须返回 `hello`。启用自适应模式时还必须携带当前 `realtimeHint`、`nextWssReportAfterMs` 和 `modeRevision`，格式以 [自适应动态上报规范](ADAPTIVE_REPORTING_SPEC.md) 为准：
    ```json
    {
      "type": "hello",
      "protocol": "update",
-     "ts": 1729700000000
+     "ts": 1729700000000,
+     "realtimeHint": false,
+     "nextWssReportAfterMs": 60000,
+     "modeRevision": 1
    }
    ```
 2. **客户端实时上报**：
    通过 WebSocket 发送文本格式的完整 Metrics JSON Payload。
-3. **服务端 Ack 与调度指令**：
+3. **服务端报告确认与模式推送**：
+   专题规范要求服务端将报告确认和模式变化明确区分，不能用一条旧报告 ACK 覆盖较新的模式。下面示例是看板状态变化时的模式推送：
    ```json
    {
      "type": "ack",
+     "ackFor": "mode",
      "ts": 1729700000000,
-     "persisted": true,
-     "nextWssReportAfterMs": 1000,
-     "realtimeHint": false
+     "modeRevision": 2,
+     "nextWssReportAfterMs": 2000,
+     "realtimeHint": true
    }
    ```
-   - `nextWssReportAfterMs`：允许服务端动态调控 Agent 下一次长连接上报间隔。
+   报告 ACK 使用 `ackFor:"report"` 并回显 `reportId`；批量持久化确认语义见专题规范。
+   - `nextWssReportAfterMs`：模式推送对 Agent 下一次上报时间的建议。
    - `realtimeHint`：指示当前是否处于仪表盘实时查看模式。
 
 ---

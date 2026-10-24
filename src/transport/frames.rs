@@ -1,7 +1,7 @@
 //! WebSocket frames and payload decoding.
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WsHelloFrame {
@@ -11,12 +11,20 @@ pub struct WsHelloFrame {
     pub ts: i64,
     #[serde(default)]
     pub protocol: String,
+    #[serde(default, rename = "realtimeHint")]
+    pub realtime_hint: Option<bool>,
+    #[serde(default, rename = "nextWssReportAfterMs")]
+    pub next_wss_report_after_ms: Option<u64>,
+    #[serde(default, rename = "modeRevision")]
+    pub mode_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WsServerFrame {
     #[serde(default)]
     pub r#type: String,
+    #[serde(default, rename = "ackFor")]
+    pub ack_for: Option<String>,
     #[serde(default)]
     pub ts: i64,
     #[serde(default)]
@@ -24,9 +32,17 @@ pub struct WsServerFrame {
     #[serde(default, rename = "nextD1WriteAfterMs")]
     pub next_d1_write_after_ms: Option<i64>,
     #[serde(default, rename = "nextWssReportAfterMs")]
-    pub next_wss_report_after_ms: Option<i64>,
+    pub next_wss_report_after_ms: Option<u64>,
     #[serde(default, rename = "realtimeHint")]
-    pub realtime_hint: bool,
+    pub realtime_hint: Option<bool>,
+    #[serde(default, rename = "modeRevision")]
+    pub mode_revision: Option<u64>,
+    #[serde(default, rename = "reportId")]
+    pub report_id: Option<String>,
+    #[serde(default)]
+    pub accepted: Option<bool>,
+    #[serde(default, rename = "acceptedSamples")]
+    pub accepted_samples: Option<usize>,
     #[serde(default)]
     pub error: String,
     #[serde(default)]
@@ -82,7 +98,10 @@ pub fn wss_config_body_and_headers(
                     headers.insert(k.clone(), s.to_string());
                 }
             }
-            if let Some(h_md5) = headers.get("X-Agent-Config-Md5").or_else(|| headers.get("x-agent-config-md5")) {
+            if let Some(h_md5) = headers
+                .get("X-Agent-Config-Md5")
+                .or_else(|| headers.get("x-agent-config-md5"))
+            {
                 if md5.is_empty() {
                     md5 = h_md5.clone();
                 }
@@ -131,7 +150,9 @@ pub fn wss_config_body_and_headers(
     }
 }
 
-pub fn wss_config_payload(payload: &serde_json::Value) -> (String, String, HashMap<String, String>) {
+pub fn wss_config_payload(
+    payload: &serde_json::Value,
+) -> (String, String, HashMap<String, String>) {
     match payload {
         serde_json::Value::String(s) => (s.trim().to_string(), String::new(), HashMap::new()),
         serde_json::Value::Object(map) => {
@@ -165,9 +186,25 @@ pub fn wss_config_payload(payload: &serde_json::Value) -> (String, String, HashM
 
             let mut serializer = url::form_urlencoded::Serializer::new(String::new());
             let keys = [
-                "collect_interval", "report_interval", "wss_report_interval", "reset_day", "schema_version",
-                "interface", "connection_mode", "ping_mode", "custom_ct", "custom_cu", "custom_cm",
-                "custom_bd", "node_1", "node_2", "node_3", "node_4", "rx_correction", "tx_correction", "update",
+                "collect_interval",
+                "report_interval",
+                "wss_report_interval",
+                "reset_day",
+                "schema_version",
+                "interface",
+                "connection_mode",
+                "ping_mode",
+                "custom_ct",
+                "custom_cu",
+                "custom_cm",
+                "custom_bd",
+                "node_1",
+                "node_2",
+                "node_3",
+                "node_4",
+                "rx_correction",
+                "tx_correction",
+                "update",
             ];
             for key in keys {
                 if let Some(val) = map.get(key) {
@@ -185,7 +222,13 @@ pub fn wss_string_from_value(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::String(s) => s.trim().to_string(),
         serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::Bool(b) => if *b { "1".to_string() } else { "0".to_string() },
+        serde_json::Value::Bool(b) => {
+            if *b {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            }
+        }
         _ => String::new(),
     }
 }

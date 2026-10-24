@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::transport::{
-    is_wss_schedule_inactive_reason, TransportHost, AGENT_WSS_MODE_ACTIVE,
-    AGENT_WSS_MODE_DISABLED, AGENT_WSS_MODE_HEADER, AGENT_WSS_MODE_INACTIVE,
-    AGENT_WSS_REASON_HEADER, AGENT_WSS_SCHEDULE_INACTIVE,
+    is_wss_schedule_inactive_reason, TransportHost, AGENT_WSS_MODE_ACTIVE, AGENT_WSS_MODE_DISABLED,
+    AGENT_WSS_MODE_HEADER, AGENT_WSS_MODE_INACTIVE, AGENT_WSS_REASON_HEADER,
+    AGENT_WSS_SCHEDULE_INACTIVE,
 };
 use crate::types::Config;
 use crate::util::log::Logger;
@@ -55,7 +55,8 @@ impl TransportHost for Agent {
     fn calibrate_date(&self, date_str: &str, rtt: Duration) {
         if let Some(date_time) = crate::util::clock::parse_http_date(date_str) {
             let clk = self.clock.lock().unwrap();
-            let (snapshot, updated) = clk.update_date(date_time, rtt, SystemTime::now(), Instant::now());
+            let (snapshot, updated) =
+                clk.update_date(date_time, rtt, SystemTime::now(), Instant::now());
             if updated {
                 self.log.debug(&format!(
                     "Date header time calibrated offset_ms={} round_trip_ms={}",
@@ -149,8 +150,88 @@ impl TransportHost for Agent {
         self.wake_tick();
     }
 
-    fn apply_wss_remote_config(&self, body: &[u8], headers: &HashMap<String, String>) -> Result<(), String> {
+    fn apply_wss_remote_config(
+        &self,
+        body: &[u8],
+        headers: &HashMap<String, String>,
+    ) -> Result<(), String> {
         self.apply_remote_config_with_options(body, headers, true)
+    }
+
+    fn apply_wss_mode(
+        &self,
+        realtime: bool,
+        interval_ms: u64,
+        revision: u64,
+        initial: bool,
+    ) -> bool {
+        let now = Instant::now();
+        let interval = Duration::from_millis(interval_ms.clamp(1_000, 300_000));
+        let mut adaptive = self.adaptive_reporting.lock().unwrap();
+
+        if !initial && revision == 0 {
+            self.log.debug("ignored unversioned WSS mode update");
+            return false;
+        }
+        if !initial && revision != 0 && revision <= adaptive.mode_revision {
+            self.log.debug(&format!(
+                "ignored stale WSS mode revision={} current={}",
+                revision, adaptive.mode_revision
+            ));
+            return false;
+        }
+
+        adaptive.mode = if realtime {
+            super::AdaptiveMode::Realtime
+        } else {
+            super::AdaptiveMode::IdleBatch
+        };
+        adaptive.interval = interval;
+        if revision != 0 {
+            adaptive.mode_revision = revision;
+        }
+        adaptive.generation = adaptive.generation.wrapping_add(1);
+
+        if initial {
+            adaptive.initial_snapshot_pending = !realtime;
+            adaptive.force_report = realtime;
+            adaptive.next_report_due = Some(now);
+            *self.last_sample.lock().unwrap() = Some(now);
+        } else if realtime {
+            adaptive.initial_snapshot_pending = false;
+            adaptive.force_report = true;
+            adaptive.next_report_due = Some(now);
+        } else {
+            adaptive.force_report = false;
+            adaptive.next_report_due = Some(
+                now + super::reporter::jittered_idle_interval(interval, Duration::from_secs(2)),
+            );
+        }
+
+        self.log.info(&format!(
+            "WSS adaptive mode={} interval_ms={} revision={} initial={}",
+            if realtime { "realtime" } else { "idle_batch" },
+            interval.as_millis(),
+            revision,
+            initial
+        ));
+        drop(adaptive);
+        self.wake_tick();
+        true
+    }
+
+    fn apply_wss_report_ack(
+        &self,
+        report_id: &str,
+        accepted: bool,
+        persisted: Option<bool>,
+        accepted_samples: Option<usize>,
+    ) {
+        self.handle_wss_report_ack(report_id, accepted, persisted, accepted_samples);
+    }
+
+    fn handle_wss_message_too_big(&self) {
+        self.shrink_pending_report();
     }
 
     fn wake_tick(&self) {
@@ -197,8 +278,13 @@ impl Agent {
         if !was_disabled {
             return;
         }
-        let r = if reason.is_empty() { "server_active" } else { reason };
-        self.log.info(&format!("WSS temporary disable cleared reason={}", r));
+        let r = if reason.is_empty() {
+            "server_active"
+        } else {
+            reason
+        };
+        self.log
+            .info(&format!("WSS temporary disable cleared reason={}", r));
         self.sync_report_transport();
         self.wake_tick();
     }

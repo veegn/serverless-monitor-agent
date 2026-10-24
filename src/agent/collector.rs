@@ -160,8 +160,21 @@ impl Agent {
             metrics: sample_metrics_to_map(m),
         });
         if samples.len() > MAX_BUFFERED_METRIC_SAMPLES {
-            let excess = samples.len() - MAX_BUFFERED_METRIC_SAMPLES;
-            samples.drain(0..excess);
+            let pending_batch = self
+                .pending_report
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|pending| pending.kind == super::reporter::PendingReportKind::MemoryBatch)
+                .unwrap_or(false);
+            if pending_batch {
+                // Keep the samples represented by the pending body at the queue
+                // head until its matching ACK arrives.
+                samples.pop();
+            } else {
+                let excess = samples.len() - MAX_BUFFERED_METRIC_SAMPLES;
+                samples.drain(0..excess);
+            }
         }
         *self.last_sample.lock().unwrap() = Some(now);
     }

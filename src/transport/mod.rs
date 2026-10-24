@@ -17,10 +17,10 @@ pub use schedule::{
     is_auth_config_http_status, is_wss_schedule_inactive_reason, next_wss_backoff,
     next_wss_reconnect_backoff, wss_schedule_inactive_from_frame,
     wss_schedule_inactive_from_handshake, wss_schedule_inactive_from_headers,
-    AGENT_WSS_MODE_ACTIVE, AGENT_WSS_MODE_DISABLED, AGENT_WSS_MODE_HEADER,
-    AGENT_WSS_MODE_INACTIVE, AGENT_WSS_REASON_HEADER, AGENT_WSS_SCHEDULE_DISABLED,
-    AGENT_WSS_SCHEDULE_EMPTY, AGENT_WSS_SCHEDULE_INACTIVE, WSS_FAST_RETRY_INTERVAL,
-    WSS_NETWORK_MAX_RETRY, WSS_NETWORK_MIN_RETRY, WSS_PROTOCOL_RETRY_DELAY,
+    AGENT_WSS_MODE_ACTIVE, AGENT_WSS_MODE_DISABLED, AGENT_WSS_MODE_HEADER, AGENT_WSS_MODE_INACTIVE,
+    AGENT_WSS_REASON_HEADER, AGENT_WSS_SCHEDULE_DISABLED, AGENT_WSS_SCHEDULE_EMPTY,
+    AGENT_WSS_SCHEDULE_INACTIVE, WSS_FAST_RETRY_INTERVAL, WSS_NETWORK_MAX_RETRY,
+    WSS_NETWORK_MIN_RETRY, WSS_PROTOCOL_RETRY_DELAY,
 };
 pub use url::{report_websocket_url, report_websocket_url_with_config};
 
@@ -39,7 +39,7 @@ pub const WSS_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 pub const WSS_WRITE_TIMEOUT: Duration = Duration::from_secs(8);
 pub const WSS_READ_IDLE_GRACE: Duration = Duration::from_secs(45);
 pub const WSS_READ_IDLE_MIN: Duration = Duration::from_secs(45);
-pub const WSS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
+pub const WSS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 pub const WSS_CONFIG_MIN_INTERVAL: Duration = Duration::from_secs(60);
 pub const WSS_DYNAMIC_MIN_INTERVAL: Duration = Duration::from_secs(1);
 pub const WSS_DYNAMIC_MAX_INTERVAL: Duration = Duration::from_secs(300);
@@ -53,7 +53,29 @@ pub trait TransportHost: Send + Sync {
     fn note_report_failure(&self, status_code: i32);
     fn note_report_success(&self);
     fn disable_wss_runtime(&self, reason: &str);
-    fn apply_wss_remote_config(&self, body: &[u8], headers: &HashMap<String, String>) -> Result<(), String>;
+    fn apply_wss_remote_config(
+        &self,
+        body: &[u8],
+        headers: &HashMap<String, String>,
+    ) -> Result<(), String>;
+    fn apply_wss_mode(
+        &self,
+        _realtime: bool,
+        _interval_ms: u64,
+        _revision: u64,
+        _initial: bool,
+    ) -> bool {
+        true
+    }
+    fn apply_wss_report_ack(
+        &self,
+        _report_id: &str,
+        _accepted: bool,
+        _persisted: Option<bool>,
+        _accepted_samples: Option<usize>,
+    ) {
+    }
+    fn handle_wss_message_too_big(&self) {}
     fn wake_tick(&self);
 }
 
@@ -66,6 +88,8 @@ struct Inner {
     running: bool,
     stopped: bool,
     restart_requested: bool,
+    auth_failed: bool,
+    server_overload_attempt: usize,
 }
 
 pub struct ReportTransport {
@@ -83,7 +107,8 @@ impl ReportTransport {
         let ws_url = match report_websocket_url(&cfg.worker_url) {
             Ok(u) => u,
             Err(e) => {
-                host.logger().info(&format!("WSS retry delayed reason=invalid_url error={}", e));
+                host.logger()
+                    .info(&format!("WSS retry delayed reason=invalid_url error={}", e));
                 String::new()
             }
         };
@@ -99,6 +124,8 @@ impl ReportTransport {
                 running: false,
                 stopped: false,
                 restart_requested: false,
+                auth_failed: false,
+                server_overload_attempt: 0,
             })),
             conn: Arc::new(Mutex::new(None)),
             connected: Arc::new(AtomicBool::new(false)),
@@ -112,11 +139,19 @@ impl ReportTransport {
     }
 
     pub fn report_interval(&self, fallback: Duration) -> Duration {
-        self.inner.lock().unwrap().next_report_after.unwrap_or(fallback)
+        self.inner
+            .lock()
+            .unwrap()
+            .next_report_after
+            .unwrap_or(fallback)
     }
 
     pub fn report_interval_peek(&self, fallback: Duration) -> Duration {
-        self.inner.lock().unwrap().next_report_after.unwrap_or(fallback)
+        self.inner
+            .lock()
+            .unwrap()
+            .next_report_after
+            .unwrap_or(fallback)
     }
 
     pub fn set_next_report_after_ms(&self, ms: i64) {
@@ -133,7 +168,7 @@ impl ReportTransport {
         let mut inner = self.inner.lock().unwrap();
         let previous = inner.next_report_after;
         inner.next_report_after = Some(next);
-        let should_wake = previous.is_none() || Some(next) < previous;
+        let should_wake = previous != Some(next);
         drop(inner);
 
         self.host.logger().info(&format!(
@@ -152,7 +187,7 @@ impl ReportTransport {
 
     pub fn start(&self) -> bool {
         let mut inner = self.inner.lock().unwrap();
-        if inner.ws_url.is_empty() {
+        if inner.ws_url.is_empty() || inner.auth_failed {
             return false;
         }
         if inner.running {
@@ -191,7 +226,9 @@ impl ReportTransport {
 
         self.wake_cv.notify_all();
         if !reason.is_empty() {
-            self.host.logger().info(&format!("WSS stopped reason={}", reason));
+            self.host
+                .logger()
+                .info(&format!("WSS stopped reason={}", reason));
         }
     }
 
@@ -227,7 +264,11 @@ impl ReportTransport {
     }
 
     pub fn delay_protocol(&self, reason: &str) {
-        let r = if reason.is_empty() { "protocol_error" } else { reason };
+        let r = if reason.is_empty() {
+            "protocol_error"
+        } else {
+            reason
+        };
         let mut inner = self.inner.lock().unwrap();
         inner.pause_until = Some(Instant::now() + WSS_PROTOCOL_RETRY_DELAY);
         inner.pause_reason = r.to_string();
@@ -281,18 +322,36 @@ impl ReportTransport {
                         body,
                     } = &err
                     {
-                        if let Some(reason) = wss_schedule_inactive_from_handshake(*status_code, headers, body) {
+                        if let Some(reason) =
+                            wss_schedule_inactive_from_handshake(*status_code, headers, body)
+                        {
                             let delay = std::cmp::max(backoff, Duration::from_secs(30));
                             self.host.logger().warn(&format!(
                                 "WSS schedule inactive on server (status 409 reason={}), backing off for {}s before retry",
                                 reason,
                                 delay.as_secs()
                             ));
-                            if !self.wait_network_retry(&format!("schedule_inactive: {}", reason), delay) {
+                            if !self.wait_network_retry(
+                                &format!("schedule_inactive: {}", reason),
+                                delay,
+                            ) {
                                 break;
                             }
                             backoff = next_wss_reconnect_backoff(delay);
                             continue;
+                        }
+                        if *status_code == 401 || *status_code == 403 {
+                            self.host.note_report_failure(*status_code as i32);
+                            self.host.logger().error(&format!(
+                                "WSS authentication failed with HTTP {}; credentials must be corrected before reconnecting",
+                                status_code
+                            ));
+                            let mut inner = self.inner.lock().unwrap();
+                            inner.auth_failed = true;
+                            inner.stopped = true;
+                            drop(inner);
+                            self.host.wake_tick();
+                            break;
                         }
                         if is_auth_config_http_status(*status_code as i32) {
                             self.host.note_report_failure(*status_code as i32);
@@ -320,6 +379,7 @@ impl ReportTransport {
             }
 
             let mut conn = conn;
+            self.reset_report_interval();
             let hello = match self.wait_hello(&mut conn) {
                 Ok(h) => h,
                 Err(err) => {
@@ -338,6 +398,20 @@ impl ReportTransport {
                 }
             };
 
+            let realtime_hint = hello.realtime_hint.unwrap_or(true);
+            let interval_ms = hello
+                .next_wss_report_after_ms
+                .unwrap_or(if realtime_hint { 2_000 } else { 60_000 })
+                .clamp(1_000, 300_000);
+            if self.host.apply_wss_mode(
+                realtime_hint,
+                interval_ms,
+                hello.mode_revision.unwrap_or(0),
+                true,
+            ) {
+                self.set_next_report_after_ms(interval_ms as i64);
+            }
+
             {
                 let inner = self.inner.lock().unwrap();
                 if inner.stopped || !self.host.uses_wss() {
@@ -354,7 +428,6 @@ impl ReportTransport {
                 "WSS connected url={} protocol={} ts={}",
                 ws_url, hello.protocol, hello.ts
             ));
-            self.reset_report_interval();
             self.host.note_report_success();
             self.host.wake_tick();
 
@@ -367,7 +440,9 @@ impl ReportTransport {
             self.host.wake_tick();
 
             if !self.should_run() {
-                self.host.logger().info("WSS transport stopped per lifecycle request");
+                self.host
+                    .logger()
+                    .info("WSS transport stopped per lifecycle request");
                 break;
             }
 
@@ -407,11 +482,17 @@ impl ReportTransport {
             &cfg.config_md5
         };
         let ws_url = self.inner.lock().unwrap().ws_url.clone();
-        let dial_url = report_websocket_url_with_config(&ws_url, CONFIG_SCHEMA_VERSION, md5)
-            .unwrap_or(ws_url);
+        let dial_url =
+            report_websocket_url_with_config(&ws_url, CONFIG_SCHEMA_VERSION, md5).unwrap_or(ws_url);
 
         let version = self.host.version();
-        let req_id = format!("{:012x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros());
+        let req_id = format!(
+            "{:012x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros()
+        );
         let headers = [
             ("Accept", "*/*"),
             ("User-Agent", "cfsm"),
@@ -421,7 +502,12 @@ impl ReportTransport {
             ("X-Request-Id", req_id.as_str()),
         ];
 
-        dial_websocket(&dial_url, &headers, WSS_HANDSHAKE_TIMEOUT, use_public_dns_resolver(&cfg))
+        dial_websocket(
+            &dial_url,
+            &headers,
+            WSS_HANDSHAKE_TIMEOUT,
+            use_public_dns_resolver(&cfg),
+        )
     }
 
     fn wait_hello(&self, conn: &mut WebSocketConn) -> Result<WsHelloFrame, WsError> {
@@ -430,7 +516,10 @@ impl ReportTransport {
         let _ = conn.set_read_timeout(None);
 
         if opcode != WS_OPCODE_TEXT {
-            return Err(WsError::Protocol(format!("WSS hello invalid opcode={}", opcode)));
+            return Err(WsError::Protocol(format!(
+                "WSS hello invalid opcode={}",
+                opcode
+            )));
         }
         let hello: WsHelloFrame = serde_json::from_slice(&payload)
             .map_err(|e| WsError::Protocol(format!("WSS hello invalid json: {}", e)))?;
@@ -472,7 +561,7 @@ impl ReportTransport {
                 )));
             }
 
-            // Cloudflare Worker keep-alive heartbeat: send ping every 25s
+            // RFC 6455 control Ping; Cloudflare responds without waking a hibernated DO.
             if last_ping.elapsed() >= WSS_HEARTBEAT_INTERVAL {
                 let mut guard = self.conn.lock().unwrap();
                 if let Some(ref mut conn) = *guard {
@@ -524,25 +613,88 @@ impl ReportTransport {
             let frame: WsServerFrame = match serde_json::from_slice(&payload) {
                 Ok(f) => f,
                 Err(e) => {
-                    self.host.logger().debug(&format!("WSS message ignored invalid_json={}", e));
+                    self.host
+                        .logger()
+                        .debug(&format!("WSS message ignored invalid_json={}", e));
                     continue;
                 }
             };
 
             match frame.r#type.as_str() {
                 "ack" => {
-                    let persisted = frame.persisted.unwrap_or(false);
                     let next_d1 = frame.next_d1_write_after_ms.unwrap_or(0);
                     let next_wss = frame.next_wss_report_after_ms.unwrap_or(0);
-                    if let Some(ms) = frame.next_wss_report_after_ms {
-                        self.set_next_report_after_ms(ms);
-                    }
                     self.host.logger().debug(&format!(
-                        "WSS ack ts={} persisted={} nextD1WriteAfterMs={} nextWssReportAfterMs={}",
-                        frame.ts, persisted, next_d1, next_wss
+                        "WSS ack ts={} ackFor={:?} accepted={:?} persisted={:?} nextD1WriteAfterMs={} nextWssReportAfterMs={}",
+                        frame.ts, frame.ack_for, frame.accepted, frame.persisted, next_d1, next_wss
                     ));
-                    if !frame.realtime_hint {
-                        self.host.note_report_success();
+
+                    match frame.ack_for.as_deref() {
+                        Some("mode") => {
+                            if let (Some(realtime), Some(interval_ms), Some(revision)) = (
+                                frame.realtime_hint,
+                                frame.next_wss_report_after_ms,
+                                frame.mode_revision,
+                            ) {
+                                let interval_ms = interval_ms.clamp(1_000, 300_000);
+                                if self.host.apply_wss_mode(realtime, interval_ms, revision, false)
+                                {
+                                    self.set_next_report_after_ms(interval_ms as i64);
+                                }
+                            } else {
+                                self.host.logger().warn(
+                                    "WSS mode ACK ignored: realtimeHint, nextWssReportAfterMs, and modeRevision are required",
+                                );
+                            }
+                        }
+                        Some("report") => {
+                            if let Some(report_id) = frame.report_id.as_deref() {
+                                let accepted = frame.accepted.unwrap_or(false);
+                                if accepted {
+                                    self.reset_server_overload_backoff();
+                                }
+                                self.host.apply_wss_report_ack(
+                                    report_id,
+                                    accepted,
+                                    frame.persisted,
+                                    frame.accepted_samples,
+                                );
+                            } else {
+                                self.host
+                                    .logger()
+                                    .warn("WSS report ACK ignored: reportId is missing");
+                            }
+                        }
+                        None => {
+                            // Compatibility with older servers. Legacy ACKs may still
+                            // adjust the interval, but cannot confirm a queued report
+                            // because they do not identify it.
+                            if frame.persisted == Some(true) {
+                                self.host.note_report_success();
+                            }
+                            if let (Some(realtime), Some(interval_ms)) =
+                                (frame.realtime_hint, frame.next_wss_report_after_ms)
+                            {
+                                let interval_ms = interval_ms.clamp(1_000, 300_000);
+                                if self.host.apply_wss_mode(
+                                    realtime,
+                                    interval_ms,
+                                    frame.mode_revision.unwrap_or(0),
+                                    false,
+                                ) {
+                                    self.set_next_report_after_ms(interval_ms as i64);
+                                }
+                            } else if let Some(interval_ms) = frame.next_wss_report_after_ms {
+                                self.set_next_report_after_ms(
+                                    interval_ms.clamp(1_000, 300_000) as i64,
+                                );
+                            }
+                        }
+                        Some(other) => {
+                            self.host
+                                .logger()
+                                .debug(&format!("WSS ACK ignored unknown ackFor={}", other));
+                        }
                     }
                     if let Some((body, headers)) = wss_config_body_and_headers(&frame) {
                         self.apply_config_body(&body, &headers);
@@ -559,7 +711,10 @@ impl ReportTransport {
                             "WSS received schedule inactive frame ts={} reason={}, initiating protocol backoff",
                             frame.ts, schedule_reason
                         ));
-                        return Some(WsError::Protocol(format!("schedule_inactive: {}", schedule_reason)));
+                        return Some(WsError::Protocol(format!(
+                            "schedule_inactive: {}",
+                            schedule_reason
+                        )));
                     }
                     self.host.logger().error_once(
                         &format!("wss-server-err-{}", frame.code),
@@ -581,17 +736,22 @@ impl ReportTransport {
                     }
                 }
                 "hello" => {
-                    self.host.logger().debug(&format!("WSS hello repeated ts={}", frame.ts));
+                    self.host
+                        .logger()
+                        .debug(&format!("WSS hello repeated ts={}", frame.ts));
                 }
                 _ => {
-                    self.host.logger().debug(&format!("WSS message ignored type={:?}", frame.r#type));
+                    self.host
+                        .logger()
+                        .debug(&format!("WSS message ignored type={:?}", frame.r#type));
                 }
             }
         }
     }
 
     fn read_idle_timeout(&self) -> Duration {
-        let interval = self.report_interval_peek(Duration::from_secs(DEFAULT_WSS_REPORT_INTERVAL_SEC));
+        let interval =
+            self.report_interval_peek(Duration::from_secs(DEFAULT_WSS_REPORT_INTERVAL_SEC));
         let timeout = interval + WSS_READ_IDLE_GRACE;
         if timeout < WSS_READ_IDLE_MIN {
             WSS_READ_IDLE_MIN
@@ -611,7 +771,9 @@ impl ReportTransport {
             );
             return;
         }
-        self.host.logger().info(&format!("WSS config processed bytes={}", body.len()));
+        self.host
+            .logger()
+            .info(&format!("WSS config processed bytes={}", body.len()));
     }
 
     fn reserve_config_apply_slot(&self) -> bool {
@@ -679,7 +841,7 @@ impl ReportTransport {
         if let WsError::Close { code, reason } = err {
             if *code == 1013 {
                 let r = format!("WSS close code=1013 (Try Again Later) reason={}", reason);
-                let delay = std::cmp::max(*backoff, Duration::from_secs(15));
+                let delay = self.next_server_overload_backoff();
                 self.host.logger().warn(&format!(
                     "{}, backing off for {}s before reconnect",
                     r,
@@ -688,13 +850,29 @@ impl ReportTransport {
                 if !self.wait_network_retry(&r, delay) {
                     return false;
                 }
-                *backoff = next_wss_reconnect_backoff(delay);
+                *backoff = WSS_FAST_RETRY_INTERVAL;
+                return true;
+            }
+            if *code == 1009 {
+                self.host.logger().warn(
+                    "WSS peer rejected an oversized report; retaining and shrinking the pending batch",
+                );
+                self.host.handle_wss_message_too_big();
+                if !self.wait_network_retry("WSS close code=1009", WSS_FAST_RETRY_INTERVAL) {
+                    return false;
+                }
+                *backoff = WSS_FAST_RETRY_INTERVAL;
                 return true;
             }
             if *code == 1008 {
                 self.host.note_report_failure(*code as i32);
-                let r = format!("WSS close code=1008 (Auth/Policy Violation) reason={}", reason);
-                self.host.logger().warn(&format!("WSS protocol error: {}", r));
+                let r = format!(
+                    "WSS close code=1008 (Auth/Policy Violation) reason={}",
+                    reason
+                );
+                self.host
+                    .logger()
+                    .warn(&format!("WSS protocol error: {}", r));
                 self.delay_protocol(&r);
                 *backoff = WSS_PROTOCOL_RETRY_DELAY;
                 return true;
@@ -735,6 +913,22 @@ impl ReportTransport {
         let inner = self.inner.lock().unwrap();
         let (guard, _timeout_res) = self.wake_cv.wait_timeout(inner, d).unwrap();
         !(self.shutdown.load(AtomicOrdering::Relaxed) || guard.stopped)
+    }
+
+    fn next_server_overload_backoff(&self) -> Duration {
+        let mut inner = self.inner.lock().unwrap();
+        let delay = match inner.server_overload_attempt {
+            0 => Duration::from_secs(5),
+            1 => Duration::from_secs(10),
+            2 => Duration::from_secs(30),
+            _ => Duration::from_secs(60),
+        };
+        inner.server_overload_attempt = inner.server_overload_attempt.saturating_add(1).min(3);
+        delay
+    }
+
+    fn reset_server_overload_backoff(&self) {
+        self.inner.lock().unwrap().server_overload_attempt = 0;
     }
 }
 
