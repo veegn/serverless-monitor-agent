@@ -538,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "serverless-monitor-agent"
-version = "1.0.22"
+version = "1.0.23"
 dependencies = [
  "base64",
  "chrono",
