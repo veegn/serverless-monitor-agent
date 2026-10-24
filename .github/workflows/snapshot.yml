@@ -7,7 +7,7 @@ on:
       - main
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: snapshot-${{ github.ref }}
@@ -59,6 +59,10 @@ jobs:
             os: windows-latest
             use_cross: false
             asset_name: sma-windows-386.exe
+          - target: x86_64-unknown-freebsd
+            os: ubuntu-latest
+            use_cross: true
+            asset_name: sma-freebsd-amd64
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -71,12 +75,12 @@ jobs:
 
       - name: Install cross
         if: matrix.use_cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
 
       - name: Build binary (cross)
         if: matrix.use_cross
         run: |
-          cross build --release --target ${{ matrix.target }}
+          cross build --release --locked --target ${{ matrix.target }}
           mkdir -p dist
           cp target/${{ matrix.target }}/release/sma dist/${{ matrix.asset_name }}
 
@@ -84,7 +88,7 @@ jobs:
         if: "!matrix.use_cross"
         shell: bash
         run: |
-          cargo build --release --target ${{ matrix.target }}
+          cargo build --release --locked --target ${{ matrix.target }}
           mkdir -p dist
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             cp target/${{ matrix.target }}/release/sma.exe dist/${{ matrix.asset_name }}
@@ -101,6 +105,8 @@ jobs:
   snapshot:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -118,7 +124,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          VERSION="Snapshot-$(date -u +%y%m%d%H%M)"
+          VERSION="Snapshot-$(date -u +%y%m%d%H%M)-${GITHUB_SHA::8}"
           cd dist
           sha256sum * > checksums.txt
           cat checksums.txt

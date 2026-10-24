@@ -9,7 +9,11 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   test:
@@ -73,12 +77,12 @@ jobs:
 
       - name: Install cross
         if: matrix.use_cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
 
       - name: Build binary (cross)
         if: matrix.use_cross
         run: |
-          cross build --release --target ${{ matrix.target }}
+          cross build --release --locked --target ${{ matrix.target }}
           mkdir -p dist
           cp target/${{ matrix.target }}/release/sma dist/${{ matrix.asset_name }}
 
@@ -86,7 +90,7 @@ jobs:
         if: "!matrix.use_cross"
         shell: bash
         run: |
-          cargo build --release --target ${{ matrix.target }}
+          cargo build --release --locked --target ${{ matrix.target }}
           mkdir -p dist
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             cp target/${{ matrix.target }}/release/sma.exe dist/${{ matrix.asset_name }}
@@ -103,6 +107,8 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -119,7 +125,7 @@ jobs:
       - name: Upload release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name }}
         run: |
-          TAG="${{ github.event.release.tag_name || github.ref_name }}"
-          gh release view "$TAG" --repo "${{ github.repository }}" || gh release create "$TAG" --title "$TAG" --generate-notes --repo "${{ github.repository }}"
-          gh release upload "$TAG" dist/* --repo "${{ github.repository }}" --clobber
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" || gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes --repo "$GITHUB_REPOSITORY"
+          gh release upload "$RELEASE_TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber

@@ -172,11 +172,19 @@ impl Agent {
         let full_due = report_due
             && (full_at_guard.is_none()
                 || now.duration_since(full_at_guard.unwrap()) >= report_interval);
+        let native_sample_due = cfg!(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "freebsd"
+        )) && (should_wss_report || auto_discovery_due || (should_sample && wss_connected));
 
         if full_due {
             if crate::util::log::maybe_rotate_log_file(&self.paths.log_file, crate::util::log::DEFAULT_MAX_LOG_SIZE) {
                 self.log.info(&format!("log file exceeded size limit, rotated to {}.1", self.paths.log_file));
             }
+        }
+
+        if full_due || native_sample_due {
             let stats = collect_basic_stats();
             *self.basic.write().unwrap() = stats;
             *self.basic_at.lock().unwrap() = Some(now);

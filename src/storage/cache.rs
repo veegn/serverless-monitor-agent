@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Mutex;
 
 pub const MAX_CACHED_SAMPLES: usize = 5000;
 pub const BATCH_REPORT_SIZE: usize = 50;
+const CACHE_COMPACT_MIN_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CachedSample {
@@ -12,25 +14,38 @@ pub struct CachedSample {
     pub metrics: serde_json::Value,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default)]
+struct CacheState {
+    count: usize,
+    offset: u64,
+}
+
+#[derive(Debug)]
 pub struct MetricsCache {
     path: String,
+    cursor_path: String,
     max_samples: usize,
+    state: Mutex<CacheState>,
 }
 
 impl MetricsCache {
     pub fn new(path: &str) -> Self {
-        Self {
-            path: path.to_string(),
-            max_samples: MAX_CACHED_SAMPLES,
-        }
+        Self::with_max_samples(path, MAX_CACHED_SAMPLES)
     }
 
     pub fn with_max_samples(path: &str, max_samples: usize) -> Self {
-        Self {
+        let cursor_path = format!("{}.cursor", path);
+        let state = load_state(path, &cursor_path);
+        let cache = Self {
             path: path.to_string(),
+            cursor_path,
             max_samples,
+            state: Mutex::new(state),
+        };
+        if let Ok(mut state) = cache.state.lock() {
+            let _ = cache.enforce_capacity(&mut state);
         }
+        cache
     }
 
     pub fn path(&self) -> &str {
@@ -38,20 +53,12 @@ impl MetricsCache {
     }
 
     pub fn count(&self) -> usize {
-        let file = match File::open(&self.path) {
-            Ok(f) => f,
-            Err(_) => return 0,
-        };
-        let reader = BufReader::new(file);
-        reader
-            .lines()
-            .map_while(Result::ok)
-            .filter(|l| !l.trim().is_empty())
-            .count()
+        self.state.lock().unwrap().count
     }
 
     pub fn append_sample(&self, sample: &CachedSample) -> Result<(), String> {
-        self.append_samples(std::slice::from_ref(sample)).map(|_| ())
+        self.append_samples(std::slice::from_ref(sample))
+            .map(|_| ())
     }
 
     pub fn append_samples(&self, samples: &[CachedSample]) -> Result<usize, String> {
@@ -59,38 +66,50 @@ impl MetricsCache {
             return Ok(0);
         }
         if let Some(parent) = Path::new(&self.path).parent() {
-            let _ = fs::create_dir_all(parent);
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
 
+        let mut encoded = Vec::with_capacity(samples.len());
+        for sample in samples {
+            encoded.push(serde_json::to_vec(sample).map_err(|e| e.to_string())?);
+        }
+
+        let mut state = self.state.lock().unwrap();
+        if state.count == 0 && state.offset == 0 {
+            // A previous removal may have left a stale cursor sidecar behind.
+            // Reset it before starting a new queue file.
+            self.persist_cursor(0)?;
+        }
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
             .map_err(|e| format!("failed to open cache file {}: {}", self.path, e))?;
 
-        let mut written = 0;
-        for s in samples {
-            if let Ok(line) = serde_json::to_string(s) {
-                if writeln!(file, "{}", line).is_ok() {
-                    written += 1;
-                }
-            }
+        for line in &encoded {
+            file.write_all(line).map_err(|e| e.to_string())?;
+            file.write_all(b"\n").map_err(|e| e.to_string())?;
         }
-        let _ = file.flush();
+        file.flush().map_err(|e| e.to_string())?;
 
-        self.enforce_capacity();
-        Ok(written)
+        state.count = state.count.saturating_add(encoded.len());
+        self.enforce_capacity(&mut state)?;
+        Ok(encoded.len())
     }
 
     pub fn peek_batch(&self, limit: usize) -> Vec<CachedSample> {
         if limit == 0 {
             return Vec::new();
         }
+        let state = self.state.lock().unwrap();
         let file = match File::open(&self.path) {
             Ok(f) => f,
             Err(_) => return Vec::new(),
         };
-        let reader = BufReader::new(file);
+        let mut reader = BufReader::new(file);
+        if reader.seek(SeekFrom::Start(state.offset)).is_err() {
+            return Vec::new();
+        }
         let mut batch = Vec::with_capacity(limit);
 
         for line in reader.lines().map_while(Result::ok) {
@@ -112,79 +131,211 @@ impl MetricsCache {
         if count == 0 {
             return Ok(0);
         }
+        let mut state = self.state.lock().unwrap();
+        if state.count == 0 {
+            return Ok(0);
+        }
         let file = match File::open(&self.path) {
             Ok(f) => f,
             Err(_) => return Ok(0),
         };
-        let reader = BufReader::new(file);
-        let mut remaining = Vec::new();
-        let mut skipped = 0;
+        let mut reader = BufReader::new(file);
+        reader
+            .seek(SeekFrom::Start(state.offset))
+            .map_err(|e| e.to_string())?;
 
-        for line in reader.lines().map_while(Result::ok) {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
+        let mut skipped = 0usize;
+        let mut line = Vec::new();
+        while skipped < count.min(state.count) {
+            line.clear();
+            let bytes = reader
+                .read_until(b'\n', &mut line)
+                .map_err(|e| e.to_string())?;
+            if bytes == 0 {
+                break;
             }
-            if skipped < count {
+            if !line.iter().all(|b| b.is_ascii_whitespace()) {
                 skipped += 1;
-            } else {
-                remaining.push(trimmed.to_string());
             }
         }
 
-        if remaining.is_empty() {
-            let _ = fs::remove_file(&self.path);
+        state.offset = reader.stream_position().map_err(|e| e.to_string())?;
+        state.count = state.count.saturating_sub(skipped);
+        drop(reader);
+        if state.count == 0 {
+            let file_len = fs::metadata(&self.path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(state.offset);
+            match fs::remove_file(&self.path) {
+                Ok(()) => {
+                    let _ = fs::remove_file(&self.cursor_path);
+                    state.offset = 0;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let _ = fs::remove_file(&self.cursor_path);
+                    state.offset = 0;
+                }
+                Err(_) => {
+                    state.offset = file_len;
+                    self.persist_cursor(state.offset)?;
+                }
+            }
         } else {
-            let tmp_path = format!("{}.tmp", self.path);
-            let mut tmp_file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&tmp_path)
-                .map_err(|e| format!("failed to write tmp cache {}: {}", tmp_path, e))?;
-
-            for l in remaining {
-                let _ = writeln!(tmp_file, "{}", l);
-            }
-            let _ = tmp_file.flush();
-            let _ = fs::rename(&tmp_path, &self.path);
+            self.persist_cursor(state.offset)?;
+            self.compact_if_needed(&mut state)?;
         }
-
         Ok(skipped)
     }
 
     pub fn clear(&self) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap();
         if Path::new(&self.path).exists() {
             fs::remove_file(&self.path).map_err(|e| e.to_string())?;
+        }
+        *state = CacheState::default();
+        if Path::new(&self.cursor_path).exists() {
+            fs::remove_file(&self.cursor_path).map_err(|e| e.to_string())?;
         }
         Ok(())
     }
 
-    fn enforce_capacity(&self) {
-        let file = match File::open(&self.path) {
-            Ok(f) => f,
-            Err(_) => return,
-        };
-        let reader = BufReader::new(file);
-        let lines: Vec<String> = reader
-            .lines()
-            .map_while(Result::ok)
-            .filter(|l| !l.trim().is_empty())
-            .collect();
-
-        if lines.len() > self.max_samples {
-            let excess = lines.len() - self.max_samples;
-            let to_keep = &lines[excess..];
-            let tmp_path = format!("{}.tmp", self.path);
-            if let Ok(mut tmp_file) = File::create(&tmp_path) {
-                for l in to_keep {
-                    let _ = writeln!(tmp_file, "{}", l);
+    fn enforce_capacity(&self, state: &mut CacheState) -> Result<(), String> {
+        if state.count > self.max_samples {
+            let excess = state.count - self.max_samples;
+            let file = File::open(&self.path).map_err(|e| e.to_string())?;
+            let mut reader = BufReader::new(file);
+            reader
+                .seek(SeekFrom::Start(state.offset))
+                .map_err(|e| e.to_string())?;
+            let mut skipped = 0usize;
+            let mut line = Vec::new();
+            while skipped < excess {
+                line.clear();
+                let bytes = reader
+                    .read_until(b'\n', &mut line)
+                    .map_err(|e| e.to_string())?;
+                if bytes == 0 {
+                    break;
                 }
-                let _ = tmp_file.flush();
-                let _ = fs::rename(&tmp_path, &self.path);
+                if !line.iter().all(|b| b.is_ascii_whitespace()) {
+                    skipped += 1;
+                }
             }
+            state.offset = reader.stream_position().map_err(|e| e.to_string())?;
+            state.count = state.count.saturating_sub(skipped);
+            self.persist_cursor(state.offset)?;
         }
+        self.compact_if_needed(state)
     }
+
+    fn persist_cursor(&self, offset: u64) -> Result<(), String> {
+        let mut cursor = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.cursor_path)
+            .map_err(|e| e.to_string())?;
+        writeln!(cursor, "{}", offset).map_err(|e| e.to_string())?;
+        cursor.sync_all().map_err(|e| e.to_string())
+    }
+
+    fn compact_if_needed(&self, state: &mut CacheState) -> Result<(), String> {
+        if state.offset == 0 {
+            return Ok(());
+        }
+        let file_len = match fs::metadata(&self.path) {
+            Ok(meta) => meta.len(),
+            Err(_) => return Ok(()),
+        };
+        if state.offset < CACHE_COMPACT_MIN_BYTES && state.offset.saturating_mul(2) < file_len {
+            return Ok(());
+        }
+
+        let tmp_path = format!("{}.compact", self.path);
+        let mut source = File::open(&self.path).map_err(|e| e.to_string())?;
+        source
+            .seek(SeekFrom::Start(state.offset))
+            .map_err(|e| e.to_string())?;
+        let mut target = File::create(&tmp_path).map_err(|e| e.to_string())?;
+        std::io::copy(&mut source, &mut target).map_err(|e| e.to_string())?;
+        drop(source);
+        target.flush().map_err(|e| e.to_string())?;
+        target.sync_all().map_err(|e| e.to_string())?;
+        drop(target);
+        // Persist the zero cursor before replacing the compacted data file.
+        // If interrupted before rename, the old records may be replayed, but
+        // no queued samples can be skipped after a restart.
+        let previous_offset = state.offset;
+        self.persist_cursor(0)?;
+        if let Err(error) = replace_file(Path::new(&tmp_path), Path::new(&self.path)) {
+            let _ = fs::remove_file(&tmp_path);
+            self.persist_cursor(previous_offset)?;
+            return Err(error.to_string());
+        }
+        state.offset = 0;
+        Ok(())
+    }
+}
+
+fn load_state(path: &str, cursor_path: &str) -> CacheState {
+    let file_len = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    if file_len == 0 {
+        return CacheState::default();
+    }
+
+    let mut offset = fs::read_to_string(cursor_path)
+        .ok()
+        .and_then(|contents| contents.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    if offset > file_len {
+        offset = 0;
+    }
+    let count = count_records_from(path, offset);
+    CacheState { count, offset }
+}
+
+fn count_records_from(path: &str, offset: u64) -> usize {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return 0,
+    };
+    let mut reader = BufReader::new(file);
+    if reader.seek(SeekFrom::Start(offset)).is_err() {
+        return 0;
+    }
+    reader
+        .lines()
+        .map_while(Result::ok)
+        .filter(|line| !line.trim().is_empty())
+        .count()
+}
+
+#[cfg(windows)]
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    if unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::rename(from, to)
 }
 
 #[cfg(test)]
