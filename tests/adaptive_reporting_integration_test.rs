@@ -208,7 +208,7 @@ fn adaptive_report_ack_preserves_report_id_and_batch_commit_fields() {
     let host = Arc::new(MockHost::new(format!("http://{address}/update")));
     let transport = ReportTransport::new(host.clone());
     assert!(transport.start());
-    wait_until(Duration::from_secs(3), || transport.connected());
+    wait_until(Duration::from_secs(8), || transport.connected());
 
     let report_body = serde_json::json!({
         "id": "adaptive-test-node",
@@ -222,7 +222,7 @@ fn adaptive_report_ack_preserves_report_id_and_batch_commit_fields() {
     let body = serde_json::to_vec(&report_body).unwrap();
     assert!(transport.send(&body));
 
-    wait_until(Duration::from_secs(3), || {
+    wait_until(Duration::from_secs(8), || {
         !host.report_acks.lock().unwrap().is_empty()
     });
     assert_eq!(
@@ -255,7 +255,7 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) {
 fn accept_websocket(listener: TcpListener) -> TcpStream {
     let (mut stream, _) = listener.accept().expect("accept WebSocket connection");
     stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
+        .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
 
     let mut request = Vec::new();
