@@ -12,7 +12,7 @@ use crate::storage::config::{
 };
 use crate::cli::install::{install, uninstall, LEGACY_AGENT_VERSION};
 use crate::types::*;
-use crate::update::apply_scheduled_update;
+use crate::update::{apply_scheduled_update, run_manual_update, UpdateOptions};
 use std::collections::HashSet;
 use std::io::Write;
 
@@ -33,6 +33,14 @@ pub fn execute(args: &[String], mut build_version: &str) -> Result<(), AgentErro
             let (debug, config_file) = parse_run_options(rest).map_err(AgentError::Other)?;
             run(config_file.as_deref(), debug, build_version)
         }
+        "update" | "upgrade" => {
+            let opts = parse_update_options(rest).map_err(AgentError::Other)?;
+            if opts.help {
+                print_update_usage(&mut std::io::stdout());
+                return Ok(());
+            }
+            run_manual_update(opts, build_version).map_err(AgentError::Other)
+        }
         "uninstall" | "remove" | "delete" | "purge" => {
             if let Err(e) = parse_uninstall_args(rest) {
                 print_usage(&mut std::io::stderr());
@@ -50,7 +58,7 @@ pub fn execute(args: &[String], mut build_version: &str) -> Result<(), AgentErro
             Ok(())
         }
         other => Err(AgentError::Other(format!(
-            "unknown command {:?}, available commands: install | run | uninstall | version",
+            "unknown command {:?}, available commands: install | run | uninstall | update | version",
             other
         ))),
     }
@@ -218,6 +226,77 @@ pub fn parse_uninstall_args(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+pub fn parse_update_options(args: &[String]) -> Result<UpdateOptions, String> {
+    let mut opts = UpdateOptions::default();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "help" {
+            opts.help = true;
+            i += 1;
+            continue;
+        }
+        if !arg.starts_with('-') {
+            return Err(format!("unexpected argument: {}", arg));
+        }
+
+        let trimmed = arg.trim_start_matches('-');
+        let (key, inline_val) = match trimmed.split_once('=') {
+            Some((k, v)) => (k, Some(v.to_string())),
+            None => (trimmed, None),
+        };
+
+        let val = if let Some(v) = inline_val {
+            v
+        } else if key == "check" || key == "force" || key == "y" || key == "yes" || key == "h" || key == "help" {
+            "1".to_string()
+        } else if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+            i += 1;
+            args[i].clone()
+        } else {
+            String::new()
+        };
+
+        match key {
+            "check" => {
+                opts.check_only = val != "0" && val != "false";
+            }
+            "force" => {
+                opts.force = val != "0" && val != "false";
+            }
+            "y" | "yes" => {}
+            "h" | "help" => {
+                opts.help = true;
+            }
+            "install-ghproxy" | "install_ghproxy" | "proxy" => {
+                if val.is_empty() {
+                    return Err(format!("missing value for -{}", key));
+                }
+                opts.proxy = Some(val);
+            }
+            _ => return Err(format!("unknown flag: -{}", key)),
+        }
+        i += 1;
+    }
+    Ok(opts)
+}
+
+pub fn print_update_usage<W: Write>(w: &mut W) {
+    let _ = writeln!(w, "Usage: sma update [options]");
+    let _ = writeln!(w);
+    let _ = writeln!(
+        w,
+        "Check for updates and upgrade to the latest release (alias: sma upgrade)."
+    );
+    let _ = writeln!(w);
+    let _ = writeln!(w, "Options:");
+    let _ = writeln!(w, "  -check               Only check for updates without installing");
+    let _ = writeln!(w, "  -force               Force update even if current version is up to date");
+    let _ = writeln!(w, "  -install-ghproxy=URL Download proxy prefix for GitHub releases");
+    let _ = writeln!(w, "  -proxy=URL           Alias for -install-ghproxy");
+    let _ = writeln!(w, "  -h, --help           Show this help message");
+}
+
 pub fn print_usage<W: Write>(w: &mut W) {
     let _ = writeln!(w, "Usage:");
     let _ = writeln!(
@@ -229,7 +308,15 @@ pub fn print_usage<W: Write>(w: &mut W) {
         "  sma install -token=TOKEN -url=WORKER_URL [-name=NAME]   # Service discovery registration (defaults name to hostname)"
     );
     let _ = writeln!(w, "  sma run [-debug=0|1]");
+    let _ = writeln!(w, "  sma update [-check] [-force] [-install-ghproxy=URL]");
     let _ = writeln!(w, "  sma uninstall");
+    let _ = writeln!(w);
+    let _ = writeln!(w, "Commands:");
+    let _ = writeln!(w, "  install              Install and start sma as a background service");
+    let _ = writeln!(w, "  run                  Run sma in foreground");
+    let _ = writeln!(w, "  update               Check for updates and upgrade to latest release (alias: upgrade)");
+    let _ = writeln!(w, "  uninstall            Stop and remove sma service and files");
+    let _ = writeln!(w, "  version              Print current version");
     let _ = writeln!(w);
     let _ = writeln!(w, "Install Options:");
     let _ = writeln!(w, "  -id=SERVER_ID        Server ID (optional if auto-discovery enabled)");
@@ -249,6 +336,11 @@ pub fn print_usage<W: Write>(w: &mut W) {
     let _ = writeln!(w, "  -rx_correction=N     Inbound traffic correction in GB");
     let _ = writeln!(w, "  -tx_correction=N     Outbound traffic correction in GB");
     let _ = writeln!(w, "  -debug=0|1           Verbose debug logging (default 0)");
+    let _ = writeln!(w);
+    let _ = writeln!(w, "Update Options:");
+    let _ = writeln!(w, "  -check               Only check for updates without installing");
+    let _ = writeln!(w, "  -force               Force update even if current version is up to date");
+    let _ = writeln!(w, "  -install-ghproxy=URL Download proxy prefix for GitHub releases");
     let _ = writeln!(w);
     let _ = writeln!(
         w,

@@ -1,5 +1,5 @@
 use serverless_monitor_agent::cli::{
-    parse_install_options, parse_uninstall_args,
+    parse_install_options, parse_uninstall_args, parse_update_options,
 };
 use serverless_monitor_agent::types::*;
 
@@ -127,4 +127,72 @@ fn test_parse_install_options_token_alias() {
 fn test_get_system_hostname_non_empty() {
     let host = serverless_monitor_agent::util::command::get_system_hostname();
     assert!(!host.is_empty(), "hostname should not be empty");
+}
+
+#[test]
+fn test_parse_update_options_defaults() {
+    let opts = parse_update_options(&[]).unwrap();
+    assert!(!opts.check_only);
+    assert!(!opts.force);
+    assert!(opts.proxy.is_none());
+    assert!(!opts.help);
+}
+
+#[test]
+fn test_parse_update_options_check_flag() {
+    for flag in &["-check", "--check", "-check=1", "--check=true"] {
+        let opts = parse_update_options(&[flag.to_string()]).unwrap();
+        assert!(opts.check_only, "expected check_only=true for {}", flag);
+    }
+    let opts = parse_update_options(&["-check=0".to_string()]).unwrap();
+    assert!(!opts.check_only);
+}
+
+#[test]
+fn test_parse_update_options_force_flag() {
+    for flag in &["-force", "--force", "-force=1", "--force=true"] {
+        let opts = parse_update_options(&[flag.to_string()]).unwrap();
+        assert!(opts.force, "expected force=true for {}", flag);
+    }
+    let opts = parse_update_options(&["-force=0".to_string()]).unwrap();
+    assert!(!opts.force);
+}
+
+#[test]
+fn test_parse_update_options_proxy_flag() {
+    let expected = "https://ghproxy.net";
+    let cases = vec![
+        vec!["-install-ghproxy=https://ghproxy.net".to_string()],
+        vec!["--install-ghproxy".to_string(), "https://ghproxy.net".to_string()],
+        vec!["-proxy=https://ghproxy.net".to_string()],
+        vec!["--proxy".to_string(), "https://ghproxy.net".to_string()],
+        vec!["-install_ghproxy=https://ghproxy.net".to_string()],
+    ];
+
+    for args in cases {
+        let opts = parse_update_options(&args).unwrap();
+        assert_eq!(opts.proxy.as_deref(), Some(expected), "args: {:?}", args);
+    }
+}
+
+#[test]
+fn test_parse_update_options_help_flag() {
+    for flag in &["-h", "--help", "help"] {
+        let opts = parse_update_options(&[flag.to_string()]).unwrap();
+        assert!(opts.help, "expected help=true for {}", flag);
+    }
+}
+
+#[test]
+fn test_parse_update_options_rejects_invalid() {
+    let cases = vec![
+        vec!["-unknown".to_string()],
+        vec!["foobar".to_string()],
+        vec!["-proxy=".to_string()],
+        vec!["-proxy".to_string()],
+    ];
+
+    for args in cases {
+        assert!(parse_update_options(&args).is_err(), "expected error for {:?}", args);
+    }
 }

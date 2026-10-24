@@ -1,9 +1,12 @@
-use crate::util::command::{command_exists, command_output, quote_shell, run_command_quiet};
+use crate::cli::legacy::read_install_config;
+use crate::net::dns::use_public_dns_resolver;
 use crate::net::http::{download_to_file, get};
 use crate::platform::{
     apply_windows_scheduled_update, default_paths, is_synology, native_arch,
+    require_install_permission,
 };
 use crate::types::*;
+use crate::util::command::{command_exists, command_output, quote_shell, run_command_quiet};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::fs;
@@ -50,6 +53,14 @@ pub struct UpdateCandidate {
     pub asset_name: String,
     pub snapshot: bool,
     pub published_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UpdateOptions {
+    pub check_only: bool,
+    pub force: bool,
+    pub proxy: Option<String>,
+    pub help: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +130,38 @@ pub fn check_latest_update(
         .map_err(|e| format!("parse current version {:?}: {}", current_version, e))?;
 
     Ok(select_latest_stable_release(&releases, &asset_name, &current))
+}
+
+pub fn check_latest_release(
+    use_public_dns: bool,
+    snapshot: bool,
+) -> Result<Option<UpdateCandidate>, String> {
+    let (owner, name) = split_update_repo_slug(DEFAULT_UPDATE_REPO)?;
+    let os_name = if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "freebsd") {
+        "freebsd"
+    } else {
+        "linux"
+    };
+    let asset_name = expected_update_asset_name(os_name, &native_arch());
+    if asset_name.is_empty() {
+        return Err("cannot determine a compatible update asset for this build".to_string());
+    }
+
+    let releases = list_github_releases(&owner, &name, use_public_dns)?;
+    if snapshot {
+        return Ok(select_latest_snapshot_release(&releases, &asset_name));
+    }
+    let zero_version = UpdateVersion {
+        major: 0,
+        minor: 0,
+        patch: 0,
+        pre: Vec::new(),
+    };
+    Ok(select_latest_stable_release(&releases, &asset_name, &zero_version))
 }
 
 pub fn list_github_releases(
@@ -485,6 +528,137 @@ pub fn apply_scheduled_update(build_version: &str) -> Result<(), String> {
         build_version, paths.binary_file
     );
     apply_windows_scheduled_update(&paths)
+}
+
+pub fn run_manual_update(opts: UpdateOptions, build_version: &str) -> Result<(), String> {
+    if cfg!(target_os = "macos") {
+        let (ok, ver) = darwin_update_supported();
+        if !ok {
+            return Err(format!(
+                "update not supported: current builds require macOS 13 Ventura or later (detected macOS {})",
+                ver
+            ));
+        }
+    }
+
+    let paths = default_paths();
+    let (cfg, _cfg_path, using_existing_config) = match read_install_config(&paths) {
+        Ok((cfg, path)) => (cfg, path, true),
+        Err((cfg, path, _)) => (cfg, path, false),
+    };
+
+    if !opts.check_only {
+        require_install_permission(&paths)?;
+        if !using_existing_config {
+            return Err(format!(
+                "no existing agent configuration found at {}. Please run 'sma install' first to install and configure the agent",
+                paths.config_file
+            ));
+        }
+    }
+
+    let proxy = opts.proxy.clone().unwrap_or_else(|| {
+        if !cfg.update_proxy.is_empty() {
+            cfg.update_proxy.clone()
+        } else {
+            std::env::var("UPDATE_PROXY").unwrap_or_default()
+        }
+    });
+    let use_dns = use_public_dns_resolver(&cfg);
+
+    println!("[INFO] checking for updates (current version: {})...", build_version);
+
+    let is_snapshot = build_version.starts_with(SNAPSHOT_VERSION_PREFIX);
+    let candidate_opt = if opts.force {
+        check_latest_release(use_dns, is_snapshot)?
+    } else {
+        check_latest_update(build_version, use_dns)?
+    };
+
+    let candidate = match candidate_opt {
+        Some(c) => c,
+        None => {
+            if opts.force {
+                return Err("no update candidate available on GitHub for this platform".to_string());
+            }
+            println!("[INFO] current version {} is up to date", build_version);
+            return Ok(());
+        }
+    };
+
+    if opts.check_only {
+        println!(
+            "[INFO] update available: {} (current: {})",
+            candidate.tag_name, build_version
+        );
+        return Ok(());
+    }
+
+    if opts.force {
+        println!(
+            "[INFO] force reinstalling version {} (asset: {})...",
+            candidate.tag_name, candidate.asset_name
+        );
+    } else {
+        println!(
+            "[INFO] found new version {} (current: {})",
+            candidate.tag_name, build_version
+        );
+    }
+    println!("[INFO] downloading {}...", candidate.asset_name);
+    let bin_path = fetch_update_binary(&paths.config_dir, &candidate, &proxy, use_dns)?;
+    println!("[INFO] download complete, checksum verified");
+
+    #[cfg(target_os = "windows")]
+    {
+        println!("[INFO] applying update to {}...", candidate.tag_name);
+        let current_pid = std::process::id();
+        let script = format!(
+            "$ErrorActionPreference = 'Continue'; Wait-Process -Id {} -Timeout 15 -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500; & {} upgrade-apply; if ($LASTEXITCODE -eq 0) {{ Remove-Item -LiteralPath {} -Force -ErrorAction SilentlyContinue }}",
+            current_pid,
+            crate::platform::quote_powershell_literal(&bin_path),
+            crate::platform::quote_powershell_literal(&bin_path)
+        );
+        Command::new("powershell")
+            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+            .spawn()
+            .map_err(|e| format!("failed to launch Windows updater: {}", e))?;
+        println!(
+            "[INFO] update to {} scheduled; will apply immediately upon process exit",
+            candidate.tag_name
+        );
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        crate::platform::chmod_executable(&bin_path)?;
+        println!("[INFO] applying update to {}...", candidate.tag_name);
+        let mut cmd = Command::new(&bin_path);
+        cmd.arg("install");
+        if let Some(ref p) = opts.proxy {
+            cmd.arg(format!("-install-ghproxy={}", p));
+        }
+        let status = cmd.status().map_err(|e| {
+            let _ = fs::remove_file(&bin_path);
+            format!("failed to execute update installer: {}", e)
+        })?;
+        let _ = fs::remove_file(&bin_path);
+        if !status.success() {
+            return Err(format!(
+                "update installation failed with exit code: {:?}",
+                status.code()
+            ));
+        }
+        let lock_file = Path::new(&paths.config_dir).join("auto_update.lock");
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let _ = fs::write(&lock_file, now_unix.to_string().as_bytes());
+        println!("[INFO] update to {} completed successfully", candidate.tag_name);
+        Ok(())
+    }
 }
 
 pub fn update_asset_download_url(

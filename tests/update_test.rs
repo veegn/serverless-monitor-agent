@@ -185,3 +185,23 @@ fn test_update_asset_download_url() {
     .unwrap();
     assert_eq!(proxy_url, format!("https://ghproxy.example.com/{}", expected));
 }
+
+#[test]
+fn test_select_latest_stable_release_force_selects_highest_even_if_current_is_latest() {
+    let asset_name = "sma-linux-amd64";
+    let releases = vec![
+        make_release("v1.0.23", false, false, asset_name),
+        make_release("v1.0.22", false, false, asset_name),
+    ];
+
+    let current = parse_update_version("1.0.23").unwrap();
+    // Regular check: already up to date
+    let regular = select_latest_stable_release(&releases, asset_name, &current);
+    assert!(regular.is_none());
+
+    // Force check (with 0.0.0): selects v1.0.23
+    let zero = parse_update_version("0.0.0").unwrap();
+    let forced = select_latest_stable_release(&releases, asset_name, &zero);
+    assert!(forced.is_some());
+    assert_eq!(forced.unwrap().tag_name, "v1.0.23");
+}
