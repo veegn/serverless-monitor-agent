@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use crate::metrics::{
-    disk_io_stats_from_counters, read_cpu_percent, read_disk_io_counters,
+    collect_basic_stats, disk_io_stats_from_counters, read_cpu_percent, read_disk_io_counters,
     read_memory_stats, read_net_bytes, sample_metrics_to_map,
 };
 use crate::platform::native_arch;
@@ -160,17 +160,38 @@ impl Agent {
             metrics: sample_metrics_to_map(m),
         });
         if samples.len() > MAX_BUFFERED_METRIC_SAMPLES {
-            let excess = samples.len() - MAX_BUFFERED_METRIC_SAMPLES;
-            samples.drain(0..excess);
+            let pending_batch = self
+                .pending_report
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|pending| pending.kind == super::reporter::PendingReportKind::MemoryBatch)
+                .unwrap_or(false);
+            if pending_batch {
+                // Keep the samples represented by the pending body at the queue
+                // head until its matching ACK arrives.
+                samples.pop();
+            } else {
+                let excess = samples.len() - MAX_BUFFERED_METRIC_SAMPLES;
+                samples.drain(0..excess);
+            }
         }
         *self.last_sample.lock().unwrap() = Some(now);
     }
 
     pub(super) fn record_offline_sample(&self, now: Instant, cfg: &Config) {
-        self.refresh_realtime_basic_stats();
+        // Build persisted samples from current system state, not the last report snapshot.
+        *self.basic.write().unwrap() = collect_basic_stats();
+        *self.basic_at.lock().unwrap() = Some(now);
+        let net_result = read_net_bytes(&cfg.interface);
+        let net_valid = net_result.is_ok();
         let (net_now, rx_speed, tx_speed) = {
-            let net_res = read_net_bytes(&cfg.interface);
-            self.network_rates(now, net_res)
+            let rates = self.network_rates(now, net_result);
+            if net_valid {
+                rates
+            } else {
+                (NetBytes::default(), 0, 0)
+            }
         };
         let cpu = {
             let (usage, ok) = read_cpu_percent();
@@ -180,9 +201,31 @@ impl Agent {
                 "0.00".to_string()
             }
         };
+        if net_valid {
+            match crate::storage::traffic::calc_monthly_traffic(
+                &self.paths.traffic_file,
+                net_now,
+                cfg.reset_day,
+                &cfg.interface,
+            ) {
+                Ok((rx, tx)) => {
+                    *self.monthly_rx.lock().unwrap() = rx;
+                    *self.monthly_tx.lock().unwrap() = tx;
+                }
+                Err(error) => {
+                    *self.monthly_rx.lock().unwrap() = 0;
+                    *self.monthly_tx.lock().unwrap() = 0;
+                    self.log.warn_once("traffic-state", &format!("monthly traffic checkpoint failed: {}", error));
+                }
+            }
+        } else {
+            *self.monthly_rx.lock().unwrap() = 0;
+            *self.monthly_tx.lock().unwrap() = 0;
+        }
         let rx_monthly = *self.monthly_rx.lock().unwrap();
         let tx_monthly = *self.monthly_tx.lock().unwrap();
-        let disk_io = *self.disk_io.lock().unwrap();
+        let disk_io = self.sample_disk_io(now);
+        *self.disk_io.lock().unwrap() = disk_io;
         let m = self.build_metrics(cfg, &cpu, net_now, rx_speed, tx_speed, rx_monthly, tx_monthly, disk_io);
 
         let (ts, _) = self.clock.lock().unwrap().timestamp(now);

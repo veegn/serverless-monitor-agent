@@ -43,7 +43,9 @@ use crate::platform::{acquire_instance_lock, default_paths, platform_name, servi
 use crate::storage::cache::MetricsCache;
 use crate::storage::config::{normalize_config_intervals, read_config};
 use crate::transport::ReportTransport;
-use crate::types::{BasicStats, Config, DiskIOCounters, DiskIOStats, NetBytes, Paths, ProbeSnapshot};
+use crate::types::{
+    BasicStats, Config, DiskIOCounters, DiskIOStats, NetBytes, Paths, ProbeSnapshot,
+};
 use crate::util::clock::CalibratedClock;
 use crate::util::command::run_command_quiet;
 use crate::util::log::Logger;
@@ -52,6 +54,36 @@ use crate::util::log::Logger;
 pub(super) struct MetricSample {
     pub(super) at: Instant,
     pub(super) metrics: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AdaptiveMode {
+    Realtime,
+    IdleBatch,
+}
+
+pub(super) struct AdaptiveReportingState {
+    pub(super) mode: AdaptiveMode,
+    pub(super) interval: Duration,
+    pub(super) mode_revision: u64,
+    pub(super) generation: u64,
+    pub(super) next_report_due: Option<Instant>,
+    pub(super) force_report: bool,
+    pub(super) initial_snapshot_pending: bool,
+}
+
+impl Default for AdaptiveReportingState {
+    fn default() -> Self {
+        Self {
+            mode: AdaptiveMode::Realtime,
+            interval: Duration::from_secs(crate::types::DEFAULT_WSS_REPORT_INTERVAL_SEC),
+            mode_revision: 0,
+            generation: 0,
+            next_report_due: None,
+            force_report: false,
+            initial_snapshot_pending: false,
+        }
+    }
 }
 
 pub struct Agent {
@@ -75,6 +107,9 @@ pub struct Agent {
     pub(super) monthly_rx: Mutex<u64>,
     pub(super) monthly_tx: Mutex<u64>,
     pub(super) samples: Mutex<Vec<MetricSample>>,
+    pub(super) adaptive_reporting: Mutex<AdaptiveReportingState>,
+    pending_report_path: String,
+    pending_report: Mutex<Option<reporter::PendingReport>>,
     pub(super) last_sample: Mutex<Option<Instant>>,
     pub(super) last_report: Mutex<Option<Instant>>,
     pub(super) last_config_state_report_at: Mutex<Option<Instant>>,
@@ -102,14 +137,20 @@ pub fn run(config_file: Option<&str>, debug: bool, version: &str) -> Result<(), 
             let parent = Path::new(cfg_file).parent().unwrap_or(Path::new(""));
             paths.config_dir = parent.to_string_lossy().to_string();
             paths.traffic_file = parent.join("traffic.dat").to_string_lossy().to_string();
-            paths.cache_file = parent.join("metrics_cache.dat").to_string_lossy().to_string();
+            paths.cache_file = parent
+                .join("metrics_cache.dat")
+                .to_string_lossy()
+                .to_string();
         }
     }
 
     let _lock = acquire_instance_lock(&paths).map_err(AgentError::LockError)?;
 
     let mut cfg = read_config(&paths.config_file).map_err(|e| {
-        AgentError::ConfigError(format!("failed to read config {}: {}", paths.config_file, e))
+        AgentError::ConfigError(format!(
+            "failed to read config {}: {}",
+            paths.config_file, e
+        ))
     })?;
 
     if cfg.secret.is_empty() || cfg.worker_url.is_empty() {
@@ -123,6 +164,8 @@ pub fn run(config_file: Option<&str>, debug: bool, version: &str) -> Result<(), 
     normalize_config_intervals(&mut cfg);
 
     let log = Logger::new(debug);
+    let pending_report_path = format!("{}.pending", paths.cache_file);
+    let restored_pending_report = reporter::restore_pending_report(&pending_report_path);
     let agent = Arc::new(Agent {
         cfg: Arc::new(RwLock::new(cfg.clone())),
         paths: paths.clone(),
@@ -144,6 +187,9 @@ pub fn run(config_file: Option<&str>, debug: bool, version: &str) -> Result<(), 
         monthly_rx: Mutex::new(0),
         monthly_tx: Mutex::new(0),
         samples: Mutex::new(Vec::new()),
+        adaptive_reporting: Mutex::new(AdaptiveReportingState::default()),
+        pending_report_path,
+        pending_report: Mutex::new(restored_pending_report),
         last_sample: Mutex::new(None),
         last_report: Mutex::new(None),
         last_config_state_report_at: Mutex::new(None),

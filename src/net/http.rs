@@ -9,6 +9,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+const MAX_BUFFERED_HTTP_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
+const HTTP_COPY_BUFFER_SIZE: usize = 16 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
     pub status: u16,
@@ -33,7 +36,16 @@ pub fn get(
     timeout: Duration,
     use_public_dns: bool,
 ) -> Result<HttpResponse, String> {
-    request_with_redirects("GET", url_str, headers, None, timeout, use_public_dns, 5)
+    request_with_redirects(
+        "GET",
+        url_str,
+        headers,
+        None,
+        timeout,
+        use_public_dns,
+        5,
+        None,
+    )
 }
 
 pub fn post(
@@ -43,7 +55,16 @@ pub fn post(
     timeout: Duration,
     use_public_dns: bool,
 ) -> Result<HttpResponse, String> {
-    request_with_redirects("POST", url_str, headers, Some(body), timeout, use_public_dns, 0)
+    request_with_redirects(
+        "POST",
+        url_str,
+        headers,
+        Some(body),
+        timeout,
+        use_public_dns,
+        0,
+        None,
+    )
 }
 
 pub fn download_to_file<P: AsRef<Path>>(
@@ -54,34 +75,59 @@ pub fn download_to_file<P: AsRef<Path>>(
     timeout: Duration,
     use_public_dns: bool,
 ) -> Result<(), String> {
-    let resp = request_with_redirects("GET", url_str, headers, None, timeout, use_public_dns, 5)?;
-    if resp.status < 200 || resp.status >= 300 {
-        return Err(format!("download {} returned http {}", url_str, resp.status));
-    }
-    if resp.body.len() as u64 > max_bytes || resp.body.is_empty() {
-        return Err(format!(
-            "download {} has invalid size {} (limit {})",
-            url_str,
-            resp.body.len(),
-            max_bytes
-        ));
-    }
     let dest_path = dest.as_ref();
     if let Some(parent) = dest_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let tmp = dest_path.with_extension("download");
-    let mut file = File::create(&tmp).map_err(|e| e.to_string())?;
-    file.write_all(&resp.body).map_err(|e| e.to_string())?;
-    file.sync_all().map_err(|e| e.to_string())?;
-    drop(file);
+    let resp = match request_with_redirects(
+        "GET",
+        url_str,
+        headers,
+        None,
+        timeout,
+        use_public_dns,
+        5,
+        Some((&tmp, max_bytes)),
+    ) {
+        Ok(resp) => resp,
+        Err(error) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+    };
+    if resp.status < 200 || resp.status >= 300 {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "download {} returned http {}",
+            url_str, resp.status
+        ));
+    }
+    let downloaded = match std::fs::metadata(&tmp) {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error.to_string());
+        }
+    };
+    if downloaded > max_bytes || downloaded == 0 {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "download {} has invalid size {} (limit {})",
+            url_str, downloaded, max_bytes
+        ));
+    }
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
     }
-    std::fs::rename(&tmp, dest_path).map_err(|e| e.to_string())
+    if let Err(error) = replace_file(&tmp, dest_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.to_string());
+    }
+    Ok(())
 }
 
 fn request_with_redirects(
@@ -92,13 +138,26 @@ fn request_with_redirects(
     timeout: Duration,
     use_public_dns: bool,
     max_redirects: usize,
+    download: Option<(&Path, u64)>,
 ) -> Result<HttpResponse, String> {
     let mut redirect_count = 0;
     let mut owned_url = current_url.to_string();
 
     loop {
-        let resp = do_single_http_request(method, &owned_url, headers, body, timeout, use_public_dns)?;
-        if (resp.status == 301 || resp.status == 302 || resp.status == 303 || resp.status == 307 || resp.status == 308)
+        let resp = do_single_http_request(
+            method,
+            &owned_url,
+            headers,
+            body,
+            timeout,
+            use_public_dns,
+            download,
+        )?;
+        if (resp.status == 301
+            || resp.status == 302
+            || resp.status == 303
+            || resp.status == 307
+            || resp.status == 308)
             && redirect_count < max_redirects
         {
             if let Some(loc) = resp.get_header("location") {
@@ -170,6 +229,7 @@ fn do_single_http_request(
     body: Option<&[u8]>,
     timeout: Duration,
     use_public_dns: bool,
+    download: Option<(&Path, u64)>,
 ) -> Result<HttpResponse, String> {
     let parsed_url = url::Url::parse(url_str).map_err(|e| e.to_string())?;
     let scheme = parsed_url.scheme();
@@ -238,7 +298,10 @@ fn do_single_http_request(
         format!("{}:{}", host, port)
     };
 
-    let mut req_str = format!("{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n", method, path_str, host_header);
+    let mut req_str = format!(
+        "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
+        method, path_str, host_header
+    );
     let mut has_content_length = false;
 
     for (k, v) in headers {
@@ -258,7 +321,9 @@ fn do_single_http_request(
 
     req_str.push_str("\r\n");
 
-    stream.write_all(req_str.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(req_str.as_bytes())
+        .map_err(|e| e.to_string())?;
     if let Some(b) = body {
         stream.write_all(b).map_err(|e| e.to_string())?;
     }
@@ -267,13 +332,17 @@ fn do_single_http_request(
     // Read response
     let mut reader = BufReader::new(stream);
     let mut status_line = String::new();
-    reader.read_line(&mut status_line).map_err(|e| e.to_string())?;
+    reader
+        .read_line(&mut status_line)
+        .map_err(|e| e.to_string())?;
 
     let parts: Vec<&str> = status_line.split_whitespace().collect();
     if parts.len() < 2 {
         return Err(format!("invalid HTTP status line: {:?}", status_line));
     }
-    let status: u16 = parts[1].parse().map_err(|e| format!("invalid status code: {}", e))?;
+    let status: u16 = parts[1]
+        .parse()
+        .map_err(|e| format!("invalid status code: {}", e))?;
 
     let mut resp_headers = HashMap::new();
     let mut is_chunked = false;
@@ -300,15 +369,65 @@ fn do_single_http_request(
         }
     }
 
-    let mut body_bytes = Vec::new();
+    let (body_bytes, _body_size) = if let Some((path, max_bytes)) = download {
+        let mut file = File::create(path).map_err(|e| e.to_string())?;
+        let size = read_response_body(
+            &mut reader,
+            is_chunked,
+            content_length,
+            max_bytes,
+            BodySink::File(&mut file),
+        )?;
+        file.flush().map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        (Vec::new(), size)
+    } else {
+        let mut bytes = Vec::new();
+        let size = read_response_body(
+            &mut reader,
+            is_chunked,
+            content_length,
+            MAX_BUFFERED_HTTP_RESPONSE_BYTES,
+            BodySink::Memory(&mut bytes),
+        )?;
+        (bytes, size)
+    };
+
+    Ok(HttpResponse {
+        status,
+        headers: resp_headers,
+        body: body_bytes,
+    })
+}
+
+enum BodySink<'a> {
+    Memory(&'a mut Vec<u8>),
+    File(&'a mut File),
+}
+
+fn read_response_body<R: BufRead + Read>(
+    reader: &mut R,
+    is_chunked: bool,
+    content_length: Option<usize>,
+    max_bytes: u64,
+    mut sink: BodySink<'_>,
+) -> Result<u64, String> {
+    let mut total = 0u64;
+    let mut buffer = [0u8; HTTP_COPY_BUFFER_SIZE];
+
     if is_chunked {
         loop {
             let mut size_line = String::new();
-            reader.read_line(&mut size_line).map_err(|e| e.to_string())?;
+            reader
+                .read_line(&mut size_line)
+                .map_err(|e| e.to_string())?;
             let size_str = size_line.trim().split(';').next().unwrap_or("").trim();
-            let chunk_size = usize::from_str_radix(size_str, 16).map_err(|_| "invalid chunk size")?;
+            let chunk_size =
+                u64::from_str_radix(size_str, 16).map_err(|_| "invalid chunk size".to_string())?;
+            if total.saturating_add(chunk_size) > max_bytes {
+                return Err(format!("HTTP response body exceeds {} bytes", max_bytes));
+            }
             if chunk_size == 0 {
-                // skip trailer headers until blank line
                 loop {
                     let mut trailer = String::new();
                     reader.read_line(&mut trailer).map_err(|e| e.to_string())?;
@@ -318,22 +437,92 @@ fn do_single_http_request(
                 }
                 break;
             }
-            let mut chunk_buf = vec![0u8; chunk_size];
-            reader.read_exact(&mut chunk_buf).map_err(|e| e.to_string())?;
-            body_bytes.extend_from_slice(&chunk_buf);
+
+            let mut remaining = chunk_size;
+            while remaining > 0 {
+                let take = remaining.min(buffer.len() as u64) as usize;
+                reader
+                    .read_exact(&mut buffer[..take])
+                    .map_err(|e| e.to_string())?;
+                write_response_chunk(&mut sink, &mut total, &buffer[..take], max_bytes)?;
+                remaining -= take as u64;
+            }
             let mut crlf = [0u8; 2];
-            let _ = reader.read_exact(&mut crlf);
+            reader.read_exact(&mut crlf).map_err(|e| e.to_string())?;
+            if crlf != *b"\r\n" {
+                return Err("invalid HTTP chunk terminator".to_string());
+            }
         }
-    } else if let Some(cl) = content_length {
-        body_bytes.resize(cl, 0);
-        reader.read_exact(&mut body_bytes).map_err(|e| e.to_string())?;
+    } else if let Some(length) = content_length {
+        if length as u64 > max_bytes {
+            return Err(format!("HTTP response body exceeds {} bytes", max_bytes));
+        }
+        let mut remaining = length as u64;
+        while remaining > 0 {
+            let take = remaining.min(buffer.len() as u64) as usize;
+            reader
+                .read_exact(&mut buffer[..take])
+                .map_err(|e| e.to_string())?;
+            write_response_chunk(&mut sink, &mut total, &buffer[..take], max_bytes)?;
+            remaining -= take as u64;
+        }
     } else {
-        reader.read_to_end(&mut body_bytes).map_err(|e| e.to_string())?;
+        loop {
+            let read = reader.read(&mut buffer).map_err(|e| e.to_string())?;
+            if read == 0 {
+                break;
+            }
+            write_response_chunk(&mut sink, &mut total, &buffer[..read], max_bytes)?;
+        }
     }
 
-    Ok(HttpResponse {
-        status,
-        headers: resp_headers,
-        body: body_bytes,
-    })
+    Ok(total)
+}
+
+fn write_response_chunk(
+    sink: &mut BodySink<'_>,
+    total: &mut u64,
+    chunk: &[u8],
+    max_bytes: u64,
+) -> Result<(), String> {
+    let next = total
+        .checked_add(chunk.len() as u64)
+        .ok_or_else(|| "HTTP response body size overflow".to_string())?;
+    if next > max_bytes {
+        return Err(format!("HTTP response body exceeds {} bytes", max_bytes));
+    }
+    match sink {
+        BodySink::Memory(bytes) => bytes.extend_from_slice(chunk),
+        BodySink::File(file) => file.write_all(chunk).map_err(|e| e.to_string())?,
+    }
+    *total = next;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    if unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
 }

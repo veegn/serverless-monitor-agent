@@ -553,6 +553,7 @@ dependencies = [
  "sha2",
  "url",
  "webpki-roots",
+ "windows-sys",
 ]
 
 [[package]]
