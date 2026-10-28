@@ -8,6 +8,7 @@ use std::sync::{Mutex, OnceLock};
 static PROC_CPU: Mutex<Option<CpuTimes>> = Mutex::new(None);
 static LINUX_BOOT_TIME: OnceLock<i64> = OnceLock::new();
 static LINUX_OS_NAME: OnceLock<String> = OnceLock::new();
+static LINUX_KERNEL: OnceLock<String> = OnceLock::new();
 static LINUX_CPU_INFO: OnceLock<String> = OnceLock::new();
 
 pub fn read_cpu_percent() -> (f64, bool) {
@@ -103,7 +104,8 @@ pub fn parse_proc_meminfo() -> Option<LinuxMemStats> {
         return None;
     }
 
-    let mem_used_mb = memory_used_mb_from_kb(total_kb, available_kb, free_kb, buffers_kb, cached_kb);
+    let mem_used_mb =
+        memory_used_mb_from_kb(total_kb, available_kb, free_kb, buffers_kb, cached_kb);
     let swap_used_mb = swap_used_mb_from_kb(swap_total_kb, swap_free_kb);
 
     Some(LinuxMemStats {
@@ -133,7 +135,18 @@ pub fn collect_basic_stats() -> BasicStats {
         boot_time_ms: linux_boot_time_ms(),
         os_name: linux_os_name(),
         arch: native_arch().to_string(),
-        kernel: crate::util::command::command_output("uname", &["-r"]),
+        kernel: LINUX_KERNEL
+            .get_or_init(|| unsafe {
+                let mut info: libc::utsname = std::mem::zeroed();
+                if libc::uname(&mut info) == 0 {
+                    std::ffi::CStr::from_ptr(info.release.as_ptr())
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    String::new()
+                }
+            })
+            .clone(),
         cpu_info: linux_cpu_info(),
         cpu_cores: num_cpus(),
         gpu_info: detect_gpu_info(),
@@ -436,7 +449,8 @@ pub fn disk_usage_linux() -> (u64, u64, Vec<DiskDeviceRef>) {
                                 device_id = pool.to_string();
                             }
                         }
-                        let (device, has_device) = linux_disk_device_ref(dev, &mount_point, &device_id);
+                        let (device, has_device) =
+                            linux_disk_device_ref(dev, &mount_point, &device_id);
                         let entry = DiskUsageEntry {
                             total: size,
                             used,
@@ -446,7 +460,9 @@ pub fn disk_usage_linux() -> (u64, u64, Vec<DiskDeviceRef>) {
 
                         let fsid_key = {
                             let (v0, v1): (libc::c_int, libc::c_int) = unsafe {
-                                if std::mem::size_of::<libc::fsid_t>() == std::mem::size_of::<(libc::c_int, libc::c_int)>() {
+                                if std::mem::size_of::<libc::fsid_t>()
+                                    == std::mem::size_of::<(libc::c_int, libc::c_int)>()
+                                {
                                     std::mem::transmute_copy(&st.f_fsid)
                                 } else {
                                     (0, 0)
@@ -669,8 +685,25 @@ fn include_linux_mount(dev: &str, mount_point: &str, fs_type: &str, opts: &str) 
         return true;
     }
     const EXCLUDED_FS: &[&str] = &[
-        "tmpfs", "devtmpfs", "udev", "nfs", "cifs", "smb", "vboxsf", "9p", "fuse", "overlay", "proc", "devpts",
-        "sysfs", "cgroup", "mqueue", "hugetlbfs", "debugfs", "binfmt_misc", "securityfs",
+        "tmpfs",
+        "devtmpfs",
+        "udev",
+        "nfs",
+        "cifs",
+        "smb",
+        "vboxsf",
+        "9p",
+        "fuse",
+        "overlay",
+        "proc",
+        "devpts",
+        "sysfs",
+        "cgroup",
+        "mqueue",
+        "hugetlbfs",
+        "debugfs",
+        "binfmt_misc",
+        "securityfs",
     ];
     for &exc in EXCLUDED_FS {
         if fs_lower == exc || fs_lower.starts_with(exc) {

@@ -130,6 +130,7 @@ pub fn download_to_file<P: AsRef<Path>>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn request_with_redirects(
     method: &str,
     current_url: &str,

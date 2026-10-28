@@ -26,7 +26,13 @@ impl Agent {
         fallback: bool,
     ) -> i32 {
         let label = if fallback { "POST fallback" } else { "report" };
-        let req_id = format!("{:012x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros());
+        let req_id = format!(
+            "{:012x}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros()
+        );
         self.log.debug(&format!(
             "{} attempt url={} payload_bytes={} samples={} req_id={}",
             label,
@@ -36,7 +42,11 @@ impl Agent {
             req_id
         ));
 
-        let md5 = if cfg.config_md5.is_empty() { "none" } else { &cfg.config_md5 };
+        let md5 = if cfg.config_md5.is_empty() {
+            "none"
+        } else {
+            &cfg.config_md5
+        };
         let headers = [
             ("Content-Type", "application/json"),
             ("Accept", "*/*"),
@@ -59,9 +69,13 @@ impl Agent {
             Err(e) => {
                 self.log.error_once(
                     &format!("{}-net-err", label),
-                    &format!("{} network request failed [req_id={}]: {}", label, req_id, e),
+                    &format!(
+                        "{} network request failed [req_id={}]: {}",
+                        label, req_id, e
+                    ),
                 );
-                self.log.debug(&format!("{} failed: {} req_id={}", label, e, req_id));
+                self.log
+                    .debug(&format!("{} failed: {} req_id={}", label, e, req_id));
                 return 0;
             }
         };
@@ -106,7 +120,8 @@ impl Agent {
         self.apply_auto_discovery_headers(headers);
 
         if status_code == 404
-            && headers.get(AGENT_AUTO_DISCOVERY_HEADER)
+            && headers
+                .get(AGENT_AUTO_DISCOVERY_HEADER)
                 .map(|s| s.trim())
                 .unwrap_or("")
                 .is_empty()
@@ -137,7 +152,8 @@ impl Agent {
                 let mut last_key = self.last_config_reject_key.lock().unwrap();
                 if *last_key != e {
                     *last_key = e.clone();
-                    self.log.warn(&format!("dynamic configuration rejected: {}", e));
+                    self.log
+                        .warn(&format!("dynamic configuration rejected: {}", e));
                 }
             } else {
                 *self.last_config_reject_key.lock().unwrap() = String::new();
@@ -183,10 +199,10 @@ impl Agent {
                 }
                 *self.cfg.write().unwrap() = next_cfg;
                 self.log.info("auto discovery created server successfully, please check dashboard after 2 minutes");
-                self.discovery_just_bound.store(true, AtomicOrdering::Relaxed);
                 if let Some(r) = self.reporter.lock().unwrap().as_ref() {
                     r.reset_report_interval();
                 }
+                self.sync_report_transport();
                 self.wake_tick();
             }
             AGENT_AUTO_DISCOVERY_REUSED => {

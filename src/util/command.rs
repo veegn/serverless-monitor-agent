@@ -123,16 +123,10 @@ fn wait_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<std::pr
     // Drain both pipes while polling the child. Waiting on the process without
     // readers can deadlock when a command fills stdout or stderr.
     let mut stdout = child.stdout.take().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "failed to capture command stdout",
-        )
+        std::io::Error::other("failed to capture command stdout")
     })?;
     let mut stderr = child.stderr.take().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "failed to capture command stderr",
-        )
+        std::io::Error::other("failed to capture command stderr")
     })?;
     let stdout_reader = thread::spawn(move || {
         let mut bytes = Vec::new();
@@ -174,10 +168,10 @@ fn wait_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<std::pr
     // The child has exited or was killed, so both pipe readers can now finish.
     let stdout = stdout_reader
         .join()
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "stdout reader panicked"))??;
+        .map_err(|_| std::io::Error::other("stdout reader panicked"))??;
     let stderr = stderr_reader
         .join()
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "stderr reader panicked"))??;
+        .map_err(|_| std::io::Error::other("stderr reader panicked"))??;
 
     match status {
         Ok(status) => Ok(std::process::Output {

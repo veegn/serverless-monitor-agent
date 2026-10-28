@@ -225,31 +225,29 @@ PowerShell -ExecutionPolicy Bypass -File $script uninstall
 
 ## 上报数据说明
 
-Agent 优先使用 WebSocket 上报，并保留旧版 `POST` fallback。配置中的 `WORKER_URL` 仍填写 HTTP(S) 上报地址，例如 `https://example.com/update`；Agent 会把 `https://` 转为 `wss://`、把 `http://` 转为 `ws://`，路径和查询参数保持不变。WebSocket 握手使用标准 `GET + Upgrade`。
+已绑定节点通过 WebSocket 上报。`WORKER_URL` 填写 HTTP(S) 上报地址，例如 `https://example.com/update`；Agent 会将其转换为 `wss://example.com/update` 并进行标准 WebSocket 握手。POST 用于自动注册及流量修正确认；断线时继续采样、缓存并重连。
 
-WSS 建连成功后，Agent 会等待服务端 hello：
-
-```json
-{ "type": "hello", "ts": 1720000000000, "protocol": "update" }
-```
-
-第一条有效 WSS 上报发送的就是旧 POST body，不改变 payload 结构；后续同一连接内也继续发送相同结构。旧版接收端仍可按 `REPORT_INTERVAL` 接收 `POST` fallback，`Content-Type` 为 `application/json`。为了兼容旧版接收端，`metrics` 内大多数基础指标仍以字符串上报；新增的 `disk` 磁盘 IO 对象使用数值类型。
-
-WSS 可用且 `CONNECTION_MODE=auto` 时，Agent 使用服务端配置的 `WSS_REPORT_INTERVAL` 发送实时上报，默认 2 秒，可配置为 1-5 秒；当 `COLLECT_INTERVAL=0` 或大于该值时，实际采样间隔同步使用 `WSS_REPORT_INTERVAL`。服务端 ack 可通过 `nextWssReportAfterMs` 动态调整下一次 WSS 上报间隔，前端有实时订阅时使用该配置值；无前端访问时改用 `REPORT_INTERVAL`，但最低为 60 秒。`CONNECTION_MODE=http` 时不启动 WSS，只按 `REPORT_INTERVAL` 走 `POST /update`。服务端 `/update` WSS 使用 Durable Object 标准 WebSocket API 接收 Agent 上报，让高频业务帧按 WebSocket incoming messages 口径计量；代价是 Agent 长连接存在时 DO 会保持非休眠状态并产生 duration（GB-s）。Agent 不根据服务端 D1 写入节流丢弃实时样本，持久化频率由服务端按 `server.report_interval` 控制。WSS 高频发送只刷新 CPU、内存、网卡累计流量和网速这些轻量实时字段；磁盘容量、磁盘 IO、GPU、进程数、连接数、月流量文件统计等完整指标仍按 `REPORT_INTERVAL` 或原有探测周期刷新，并在 WSS 实时包中复用最近一次缓存值。WSS 不可用时才 fallback 到 POST；WSS 写失败会立即尝试一次 POST fallback，后续 POST 失败重试按 `REPORT_INTERVAL` 限流，避免弱网时打爆 Worker。WSS 握手整体受 10 秒 deadline 约束，连接建立后如果超过当前 WSS 上报间隔加 15 秒仍未收到服务端帧，会主动关闭连接并触发兜底流程。普通 WSS 网络错误使用指数退避重连，最小 60 秒、最大 5 分钟；认证或配置类错误（HTTP `401`/`403`/`404`、WebSocket close code `1008`、服务端 `error` 帧）会同时暂停 WSS 和 POST fallback 120 秒，避免持续消耗服务端额度。WSS 时段关闭是例外：服务端会返回 `409` 和 `wss_schedule_inactive`，Agent 临时改用 POST，不写入本地 `CONNECTION_MODE`，并在后续正常 POST 响应提示 `X-Agent-Wss-Mode: active` 时立即恢复 WSS。该能力要求 Agent `v1.0.10+`。相关日志会明确使用 `WSS connected`、`WSS ack`、`WSS error`、`WSS retry delayed`、`POST fallback delayed` 等关键字区分状态。
-
-服务端 ack 示例：
+服务端 Hello 指定初始模式：
 
 ```json
-{ "type": "ack", "ts": 1720000000000, "persisted": false, "nextD1WriteAfterMs": 30000, "nextWssReportAfterMs": 60000 }
+{ "type": "hello", "protocol": "update", "realtimeHint": false, "nextWssReportAfterMs": 60000, "modeRevision": 1 }
 ```
 
-收到 ack 后 Agent 继续下一轮采集/发送；`persisted=false` 表示服务端未执行持久化写入，Agent 不会因此重试。服务端 error 示例：
+Agent 在实时、节能和断线状态下都每 2 秒独立采样并写入本地历史队列。实时快照按服务端协商周期发送，支持 1 秒周期；无访客时通常每 60 秒加减 3 秒抖动发送历史批次。实时快照与历史批次独立调度，历史 ACK 延迟不会阻塞看板刷新。系统动态指标现场采集，静态系统身份缓存；可选 GPU 工具在独立线程按 30 秒周期采集。月流量在内存逐次累加、每 30 秒写入检查点，异常退出可能丢失尚未保存的增量。
+
+模式推送和报告确认分别使用 `ackFor:"mode"` 和 `ackFor:"report"`：
 
 ```json
-{ "type": "error", "ts": 1720000000000, "error": "unauthorized", "code": 401 }
+{ "type": "ack", "ackFor": "mode", "modeRevision": 2, "realtimeHint": true, "nextWssReportAfterMs": 1000 }
 ```
 
-收到 error 后 Agent 会立即关闭当前 WSS，并暂停 WSS 和 POST fallback 120 秒后再重试。
+```json
+{ "type": "ack", "ackFor": "report", "reportId": "b-example", "accepted": true, "persisted": true, "acceptedSamples": 30 }
+```
+
+模式推送只接受递增的 `modeRevision`。历史批次只有收到匹配 `reportId`、完整样本数和持久化确认后才清理；重试及重启恢复保持原报文和 ID。实时快照允许由更新的快照替代，历史数据已独立保存在队列中。服务端必须按观测时间更新最新状态，防止较旧批次覆盖较新快照。
+
+默认历史队列上限为 5000 条，按 2 秒采样约覆盖 2.78 小时，容量超限时淘汰最老记录。历史指标包含磁盘 IO、负载、连接数和探测 RTT/丢包率。WebSocket 采用单线程读写及有界发送队列，底层 Ping 周期为 30 秒。HTTP 401/403 停止 WSS 重试并报告凭据错误；Close 1013 按 5、10、30、60 秒递增退避；Close 1009 缩小批次并使用新 ID。完整报文、持久化及服务端要求见 [自适应上报规范](docs/ADAPTIVE_REPORTING_SPEC.md)。
 
 WSS 也支持服务端下发动态配置，配置内容复用旧 POST 响应里的 query-string body；Agent 侧最短每 1 分钟处理一次 WSS 配置下发，服务端不需要在每个 ack 中都携带配置。`configMd5` 可选，带上时会按旧 `X-Agent-Config-Md5` 逻辑更新本地配置版本；不带时 Agent 会按配置字段是否变化决定是否写入本地配置。
 

@@ -2,14 +2,14 @@ use std::time::Instant;
 
 use crate::metrics::{
     collect_basic_stats, disk_io_stats_from_counters, read_cpu_percent, read_disk_io_counters,
-    read_memory_stats, read_net_bytes, sample_metrics_to_map,
+    read_net_bytes, sample_metrics_to_map,
 };
 use crate::platform::native_arch;
 use crate::storage::cache::CachedSample;
-use crate::types::{Config, DiskIOStats, Metrics, NetBytes, MAX_BUFFERED_METRIC_SAMPLES};
+use crate::types::{Config, DiskIOStats, Metrics, NetBytes};
 
 use super::probe_worker::{probe_loss_value, probe_rtt_value};
-use super::{Agent, MetricSample};
+use super::Agent;
 
 pub(super) fn counter_delta(prev: u64, current: u64) -> u64 {
     if current >= prev {
@@ -20,17 +20,6 @@ pub(super) fn counter_delta(prev: u64, current: u64) -> u64 {
 }
 
 impl Agent {
-    pub(super) fn refresh_realtime_basic_stats(&self) {
-        let (mem, ok) = read_memory_stats();
-        if ok {
-            let mut b = self.basic.write().unwrap();
-            b.mem_total_mb = mem.mem_total_mb;
-            b.mem_used_mb = mem.mem_used_mb;
-            b.swap_total_mb = mem.swap_total_mb;
-            b.swap_used_mb = mem.swap_used_mb;
-        }
-    }
-
     pub(super) fn reset_network_baseline(&self, iface: &str) {
         let current = read_net_bytes(iface).unwrap_or_default();
         *self.prev_net.lock().unwrap() = current;
@@ -48,7 +37,10 @@ impl Agent {
         let current = match current_res {
             Ok(c) => c,
             Err(e) => {
-                self.log.warn_once("network-counters", &format!("network counters unavailable: {}", e));
+                self.log.warn_once(
+                    "network-counters",
+                    &format!("network counters unavailable: {}", e),
+                );
                 return (*prev_net_guard, 0, 0);
             }
         };
@@ -115,7 +107,11 @@ impl Agent {
             disk_total: b.disk_total_mb.to_string(),
             disk_used: b.disk_used_mb.to_string(),
             disk: disk_io,
-            load_avg: if b.load_avg.is_empty() { "0 0 0".to_string() } else { b.load_avg },
+            load_avg: if b.load_avg.is_empty() {
+                "0 0 0".to_string()
+            } else {
+                b.load_avg
+            },
             boot_time: b.boot_time_ms.to_string(),
             net_rx: net_now.rx.to_string(),
             net_tx: net_now.tx.to_string(),
@@ -123,17 +119,37 @@ impl Agent {
             net_tx_monthly: tx_monthly.to_string(),
             net_in_speed: rx_speed.to_string(),
             net_out_speed: tx_speed.to_string(),
-            os: if b.os_name.is_empty() { std::env::consts::OS.to_string() } else { b.os_name },
-            arch: if b.arch.is_empty() { native_arch() } else { b.arch },
+            os: if b.os_name.is_empty() {
+                std::env::consts::OS.to_string()
+            } else {
+                b.os_name
+            },
+            arch: if b.arch.is_empty() {
+                native_arch()
+            } else {
+                b.arch
+            },
             kernel_version: b.kernel,
-            cpu_info: if b.cpu_info.is_empty() { native_arch() } else { b.cpu_info },
+            cpu_info: if b.cpu_info.is_empty() {
+                native_arch()
+            } else {
+                b.cpu_info
+            },
             cpu_cores: b.cpu_cores.to_string(),
             gpu_info: b.gpu_info,
             processes: b.processes.to_string(),
             tcp_conn: b.tcp_conn.to_string(),
             udp_conn: b.udp_conn.to_string(),
-            ip_v4: if probes.ip_v4.is_empty() { "0".to_string() } else { probes.ip_v4 },
-            ip_v6: if probes.ip_v6.is_empty() { "0".to_string() } else { probes.ip_v6 },
+            ip_v4: if probes.ip_v4.is_empty() {
+                "0".to_string()
+            } else {
+                probes.ip_v4
+            },
+            ip_v6: if probes.ip_v6.is_empty() {
+                "0".to_string()
+            } else {
+                probes.ip_v6
+            },
             ping_ct: probe_rtt_value(&cfg.ct_node, probes.ct),
             ping_cu: probe_rtt_value(&cfg.cu_node, probes.cu),
             ping_cm: probe_rtt_value(&cfg.cm_node, probes.cm),
@@ -153,87 +169,61 @@ impl Agent {
         }
     }
 
-    pub(super) fn append_sample(&self, now: Instant, m: &Metrics) {
-        let mut samples = self.samples.lock().unwrap();
-        samples.push(MetricSample {
-            at: now,
-            metrics: sample_metrics_to_map(m),
-        });
-        if samples.len() > MAX_BUFFERED_METRIC_SAMPLES {
-            let pending_batch = self
-                .pending_report
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|pending| pending.kind == super::reporter::PendingReportKind::MemoryBatch)
-                .unwrap_or(false);
-            if pending_batch {
-                // Keep the samples represented by the pending body at the queue
-                // head until its matching ACK arrives.
-                samples.pop();
-            } else {
-                let excess = samples.len() - MAX_BUFFERED_METRIC_SAMPLES;
-                samples.drain(0..excess);
-            }
+    pub(super) fn append_sample(&self, now: Instant, metrics: &Metrics) {
+        let (ts, _) = self.clock.lock().unwrap().timestamp(now);
+        let sample = CachedSample {
+            ts,
+            metrics: sample_metrics_to_map(metrics),
+        };
+        if let Err(error) = self.cache.lock().unwrap().append_sample(&sample) {
+            self.log.warn_once(
+                "cache-write",
+                &format!("could not persist metric sample: {}", error),
+            );
         }
         *self.last_sample.lock().unwrap() = Some(now);
     }
 
-    pub(super) fn record_offline_sample(&self, now: Instant, cfg: &Config) {
-        // Build persisted samples from current system state, not the last report snapshot.
+    pub(super) fn collect_current_metrics(&self, now: Instant, cfg: &Config) -> Metrics {
         *self.basic.write().unwrap() = collect_basic_stats();
         *self.basic_at.lock().unwrap() = Some(now);
         let net_result = read_net_bytes(&cfg.interface);
         let net_valid = net_result.is_ok();
-        let (net_now, rx_speed, tx_speed) = {
-            let rates = self.network_rates(now, net_result);
-            if net_valid {
-                rates
-            } else {
-                (NetBytes::default(), 0, 0)
-            }
-        };
-        let cpu = {
-            let (usage, ok) = read_cpu_percent();
-            if ok {
-                format!("{:.2}", usage)
-            } else {
-                "0.00".to_string()
-            }
+        let (net_now, rx_speed, tx_speed) = self.network_rates(now, net_result);
+        let (usage, valid_cpu) = read_cpu_percent();
+        let cpu = if valid_cpu {
+            format!("{:.2}", usage)
+        } else {
+            "0.00".to_string()
         };
         if net_valid {
-            match crate::storage::traffic::calc_monthly_traffic(
+            let mut traffic = self.traffic.lock().unwrap();
+            let tracker = traffic.get_or_insert_with(|| {
+                crate::storage::traffic::TrafficTracker::new(&self.paths.traffic_file)
+            });
+            if let Err(error) = tracker.sample(
                 &self.paths.traffic_file,
                 net_now,
                 cfg.reset_day,
                 &cfg.interface,
+                chrono::Local::now(),
+                now,
             ) {
-                Ok((rx, tx)) => {
-                    *self.monthly_rx.lock().unwrap() = rx;
-                    *self.monthly_tx.lock().unwrap() = tx;
-                }
-                Err(error) => {
-                    *self.monthly_rx.lock().unwrap() = 0;
-                    *self.monthly_tx.lock().unwrap() = 0;
-                    self.log.warn_once("traffic-state", &format!("monthly traffic checkpoint failed: {}", error));
-                }
+                self.log.warn_once(
+                    "traffic-state",
+                    &format!("monthly traffic checkpoint failed: {}", error),
+                );
             }
-        } else {
-            *self.monthly_rx.lock().unwrap() = 0;
-            *self.monthly_tx.lock().unwrap() = 0;
+            let (rx, tx) = tracker.totals();
+            *self.monthly_rx.lock().unwrap() = rx;
+            *self.monthly_tx.lock().unwrap() = tx;
         }
         let rx_monthly = *self.monthly_rx.lock().unwrap();
         let tx_monthly = *self.monthly_tx.lock().unwrap();
         let disk_io = self.sample_disk_io(now);
         *self.disk_io.lock().unwrap() = disk_io;
-        let m = self.build_metrics(cfg, &cpu, net_now, rx_speed, tx_speed, rx_monthly, tx_monthly, disk_io);
-
-        let (ts, _) = self.clock.lock().unwrap().timestamp(now);
-        let sample = CachedSample {
-            ts,
-            metrics: sample_metrics_to_map(&m),
-        };
-        let _ = self.cache.lock().unwrap().append_sample(&sample);
-        *self.last_sample.lock().unwrap() = Some(now);
+        self.build_metrics(
+            cfg, &cpu, net_now, rx_speed, tx_speed, rx_monthly, tx_monthly, disk_io,
+        )
     }
 }

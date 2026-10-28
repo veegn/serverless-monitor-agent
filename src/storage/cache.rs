@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -75,11 +75,17 @@ impl MetricsCache {
         }
 
         let mut state = self.state.lock().unwrap();
-        if state.count == 0 && state.offset == 0 {
-            // A previous removal may have left a stale cursor sidecar behind.
-            // Reset it before starting a new queue file.
-            self.persist_cursor(0)?;
+        if state.count == 0 {
+            // Recheck before truncating: startup I/O errors must not turn a
+            // temporarily unreadable queue into an empty, writable file.
+            state.count = count_records_from(&self.path, state.offset)?;
+            if state.count == 0 {
+                File::create(&self.path).map_err(|error| error.to_string())?;
+                self.persist_cursor(0)?;
+                state.offset = 0;
+            }
         }
+        repair_incomplete_tail(&self.path)?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -98,33 +104,88 @@ impl MetricsCache {
     }
 
     pub fn peek_batch(&self, limit: usize) -> Vec<CachedSample> {
-        if limit == 0 {
-            return Vec::new();
-        }
-        let state = self.state.lock().unwrap();
-        let file = match File::open(&self.path) {
-            Ok(f) => f,
-            Err(_) => return Vec::new(),
-        };
-        let mut reader = BufReader::new(file);
-        if reader.seek(SeekFrom::Start(state.offset)).is_err() {
-            return Vec::new();
-        }
-        let mut batch = Vec::with_capacity(limit);
+        self.peek_batch_checked(limit).unwrap_or_default()
+    }
 
-        for line in reader.lines().map_while(Result::ok) {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
+    pub fn peek_batch_checked(&self, limit: usize) -> Result<Vec<CachedSample>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut state = self.state.lock().unwrap();
+        self.read_batch(&mut state, limit)
+    }
+
+    fn read_batch(
+        &self,
+        state: &mut CacheState,
+        limit: usize,
+    ) -> Result<Vec<CachedSample>, String> {
+        if state.count == 0 {
+            return Ok(Vec::new());
+        }
+        let file = File::open(&self.path).map_err(|error| error.to_string())?;
+        let mut reader = BufReader::new(file);
+        reader
+            .seek(SeekFrom::Start(state.offset))
+            .map_err(|error| error.to_string())?;
+        let mut batch = Vec::with_capacity(limit);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if reader
+                .read_until(b'\n', &mut line)
+                .map_err(|error| error.to_string())?
+                == 0
+            {
+                break;
             }
-            if let Ok(sample) = serde_json::from_str::<CachedSample>(trimmed) {
+            if let Ok(sample) = serde_json::from_slice::<CachedSample>(&line) {
                 batch.push(sample);
-                if batch.len() >= limit {
+                if batch.len() == limit {
                     break;
                 }
             }
         }
-        batch
+        // Recover from records damaged after startup as well as truncated tails.
+        // A corrupt-only prefix must never block subsequent live reports.
+        if batch.len() < limit {
+            let count = batch.len();
+            if count == 0 {
+                let offset = reader
+                    .stream_position()
+                    .map_err(|error| error.to_string())?;
+                self.persist_cursor(offset)?;
+                state.offset = offset;
+            }
+            state.count = count;
+        }
+        Ok(batch)
+    }
+
+    /// Remove only a matching queue prefix, including a surviving suffix after
+    /// capacity eviction. Replayed ACKs cannot consume newly collected samples.
+    pub fn acknowledge_batch(&self, expected: &[CachedSample]) -> Result<usize, String> {
+        if expected.is_empty() {
+            return Ok(0);
+        }
+        let mut state = self.state.lock().unwrap();
+        let queued = self.read_batch(&mut state, expected.len())?;
+        let Some(first) = queued.first() else {
+            return Ok(0);
+        };
+        let Some(start) = expected.iter().position(|sample| sample == first) else {
+            return Ok(0);
+        };
+        let matched = queued
+            .iter()
+            .zip(&expected[start..])
+            .take_while(|(queued, expected)| queued == expected)
+            .count();
+        if matched == expected.len() - start {
+            self.drain_locked(&mut state, matched)
+        } else {
+            Err("cached report samples no longer match the queue prefix".to_string())
+        }
     }
 
     pub fn drain(&self, count: usize) -> Result<usize, String> {
@@ -132,6 +193,10 @@ impl MetricsCache {
             return Ok(0);
         }
         let mut state = self.state.lock().unwrap();
+        self.drain_locked(&mut state, count)
+    }
+
+    fn drain_locked(&self, state: &mut CacheState, count: usize) -> Result<usize, String> {
         if state.count == 0 {
             return Ok(0);
         }
@@ -154,18 +219,15 @@ impl MetricsCache {
             if bytes == 0 {
                 break;
             }
-            if !line.iter().all(|b| b.is_ascii_whitespace()) {
+            if serde_json::from_slice::<CachedSample>(&line).is_ok() {
                 skipped += 1;
             }
         }
 
-        state.offset = reader.stream_position().map_err(|e| e.to_string())?;
-        state.count = state.count.saturating_sub(skipped);
+        let next_offset = reader.stream_position().map_err(|e| e.to_string())?;
+        let next_count = state.count.saturating_sub(skipped);
         drop(reader);
-        if state.count == 0 {
-            let file_len = fs::metadata(&self.path)
-                .map(|metadata| metadata.len())
-                .unwrap_or(state.offset);
+        if next_count == 0 {
             match fs::remove_file(&self.path) {
                 Ok(()) => {
                     let _ = fs::remove_file(&self.cursor_path);
@@ -176,13 +238,17 @@ impl MetricsCache {
                     state.offset = 0;
                 }
                 Err(_) => {
-                    state.offset = file_len;
-                    self.persist_cursor(state.offset)?;
+                    self.persist_cursor(next_offset)?;
+                    state.offset = next_offset;
                 }
             }
+            state.count = 0;
         } else {
-            self.persist_cursor(state.offset)?;
-            self.compact_if_needed(&mut state)?;
+            // Commit the cursor before exposing its new position in memory.
+            self.persist_cursor(next_offset)?;
+            state.offset = next_offset;
+            state.count = next_count;
+            self.compact_if_needed(state)?;
         }
         Ok(skipped)
     }
@@ -217,7 +283,7 @@ impl MetricsCache {
                 if bytes == 0 {
                     break;
                 }
-                if !line.iter().all(|b| b.is_ascii_whitespace()) {
+                if serde_json::from_slice::<CachedSample>(&line).is_ok() {
                     skipped += 1;
                 }
             }
@@ -277,7 +343,58 @@ impl MetricsCache {
     }
 }
 
+fn repair_incomplete_tail(path: &str) -> Result<(), String> {
+    let mut file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let len = file.metadata().map_err(|error| error.to_string())?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::End(-1))
+        .map_err(|error| error.to_string())?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)
+        .map_err(|error| error.to_string())?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        let start = reader
+            .stream_position()
+            .map_err(|error| error.to_string())?;
+        line.clear();
+        if reader
+            .read_until(b'\n', &mut line)
+            .map_err(|error| error.to_string())?
+            == 0
+        {
+            return Ok(());
+        }
+        if !line.ends_with(b"\n") {
+            let mut file = reader.into_inner();
+            if serde_json::from_slice::<CachedSample>(&line).is_ok() {
+                file.seek(SeekFrom::End(0))
+                    .map_err(|error| error.to_string())?;
+                file.write_all(b"\n").map_err(|error| error.to_string())?;
+            } else {
+                file.set_len(start).map_err(|error| error.to_string())?;
+            }
+            file.sync_data().map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+    }
+}
+
 fn load_state(path: &str, cursor_path: &str) -> CacheState {
+    // A failed repair remains observable to the next append/read operation.
+    let _ = repair_incomplete_tail(path);
     let file_len = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
     if file_len == 0 {
         return CacheState::default();
@@ -290,28 +407,39 @@ fn load_state(path: &str, cursor_path: &str) -> CacheState {
     if offset > file_len {
         offset = 0;
     }
-    let count = count_records_from(path, offset);
+    let count = count_records_from(path, offset).unwrap_or(0);
     CacheState { count, offset }
 }
 
-fn count_records_from(path: &str, offset: u64) -> usize {
+fn count_records_from(path: &str, offset: u64) -> Result<usize, String> {
     let file = match File::open(path) {
         Ok(file) => file,
-        Err(_) => return 0,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.to_string()),
     };
     let mut reader = BufReader::new(file);
-    if reader.seek(SeekFrom::Start(offset)).is_err() {
-        return 0;
-    }
     reader
-        .lines()
-        .map_while(Result::ok)
-        .filter(|line| !line.trim().is_empty())
-        .count()
+        .seek(SeekFrom::Start(offset))
+        .map_err(|error| error.to_string())?;
+    let mut count = 0;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Err(error) => return Err(error.to_string()),
+            Ok(_) => {
+                if serde_json::from_slice::<CachedSample>(&line).is_ok() {
+                    count += 1;
+                }
+            }
+        }
+    }
+    Ok(count)
 }
 
 #[cfg(windows)]
-fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
@@ -334,7 +462,7 @@ fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
     fs::rename(from, to)
 }
 

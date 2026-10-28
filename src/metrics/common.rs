@@ -1,5 +1,5 @@
-use crate::util::command::{command_exists, command_output};
 use crate::types::*;
+use crate::util::command::{command_exists, command_output};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -68,7 +68,13 @@ pub fn disk_usage_mb_from_blocks(blocks: u64, bfree: u64, bsize: i64) -> Option<
     }
 }
 
-pub fn memory_used_mb_from_kb(total: u64, available: u64, free: u64, buffers: u64, cached: u64) -> u64 {
+pub fn memory_used_mb_from_kb(
+    total: u64,
+    available: u64,
+    free: u64,
+    buffers: u64,
+    cached: u64,
+) -> u64 {
     let avail = if available == 0 {
         free + buffers + cached
     } else {
@@ -109,8 +115,29 @@ pub fn should_include_net_interface(name: &str, wanted: &HashSet<String>) -> boo
 
 pub fn is_excluded_net_interface(name: &str) -> bool {
     const EXCLUDED: &[&str] = &[
-        "br", "cni", "docker", "podman", "flannel", "lo", "veth", "virbr", "vmbr", "tap", "fwbr", "fwpr",
-        "tailscale", "tun", "wg", "wireguard", "ipsec", "gre", "gretap", "ipip", "sit", "ip6tnl", "zerotier",
+        "br",
+        "cni",
+        "docker",
+        "podman",
+        "flannel",
+        "lo",
+        "veth",
+        "virbr",
+        "vmbr",
+        "tap",
+        "fwbr",
+        "fwpr",
+        "tailscale",
+        "tun",
+        "wg",
+        "wireguard",
+        "ipsec",
+        "gre",
+        "gretap",
+        "ipip",
+        "sit",
+        "ip6tnl",
+        "zerotier",
     ];
     for prefix in EXCLUDED {
         if name.starts_with(prefix) {
@@ -131,10 +158,31 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 pub fn parse_first_uint(raw: &str) -> u64 {
-    raw.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0)
+    raw.split_whitespace()
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
 }
 
 pub fn detect_gpu_info() -> Option<serde_json::Value> {
+    use std::sync::{Arc, OnceLock, RwLock};
+    static CACHE: OnceLock<Arc<RwLock<Option<serde_json::Value>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| {
+        let cache = Arc::new(RwLock::new(None));
+        let worker_cache = cache.clone();
+        let _ = std::thread::Builder::new()
+            .name("gpu-collector".into())
+            .spawn(move || loop {
+                let value = detect_gpu_info_uncached();
+                *worker_cache.write().unwrap() = value;
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            });
+        cache
+    });
+    cache.read().unwrap().clone()
+}
+
+fn detect_gpu_info_uncached() -> Option<serde_json::Value> {
     if command_exists("nvidia-smi") {
         let out = command_output(
             "nvidia-smi",
@@ -150,7 +198,10 @@ pub fn detect_gpu_info() -> Option<serde_json::Value> {
 
         let out = command_output(
             "nvidia-smi",
-            &["--query-gpu=index,name,utilization.gpu", "--format=csv,noheader,nounits"],
+            &[
+                "--query-gpu=index,name,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
         );
         let gpus = parse_nvidia_smi(&out, 1);
         if !gpus.is_empty() {
@@ -224,7 +275,11 @@ pub fn parse_nvidia_smi(out: &str, numeric_tail: usize) -> Vec<GpuMetric> {
 }
 
 pub fn parse_nvidia_float(raw: &str) -> serde_json::Value {
-    let s = raw.trim().trim_start_matches('[').trim_end_matches(']').trim();
+    let s = raw
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
     if s.is_empty() || s.eq_ignore_ascii_case("N/A") || s.eq_ignore_ascii_case("NOT SUPPORTED") {
         return serde_json::Value::Null;
     }
@@ -235,11 +290,18 @@ pub fn parse_nvidia_float(raw: &str) -> serde_json::Value {
     }
 }
 
-pub fn disk_io_stats_from_counters(prev: DiskIOCounters, current: DiskIOCounters, elapsed_seconds: f64) -> DiskIOStats {
+pub fn disk_io_stats_from_counters(
+    prev: DiskIOCounters,
+    current: DiskIOCounters,
+    elapsed_seconds: f64,
+) -> DiskIOStats {
     if elapsed_seconds <= 0.0 || prev.device_count == 0 || current.device_count == 0 {
         return DiskIOStats::default();
     }
-    if !prev.fingerprint.is_empty() && !current.fingerprint.is_empty() && prev.fingerprint != current.fingerprint {
+    if !prev.fingerprint.is_empty()
+        && !current.fingerprint.is_empty()
+        && prev.fingerprint != current.fingerprint
+    {
         return DiskIOStats::default();
     }
 
@@ -287,16 +349,25 @@ pub fn clamp_metric(v: f64, min_val: f64, max_val: f64) -> f64 {
     v.clamp(min_val, max_val)
 }
 
-pub fn sample_metrics_to_map(m: &Metrics) -> serde_json::Value {
-    serde_json::json!({
-        "cpu": m.cpu,
-        "ram_total": m.ram_total,
-        "ram_used": m.ram_used,
-        "swap_total": m.swap_total,
-        "swap_used": m.swap_used,
-        "net_in_speed": m.net_in_speed,
-        "net_out_speed": m.net_out_speed,
-    })
+pub fn sample_metrics_to_map(metrics: &Metrics) -> serde_json::Value {
+    let mut value = serde_json::to_value(metrics).expect("Metrics serialization cannot fail");
+    // Keep every time-varying metric in history. Host identity belongs to the
+    // report's latest snapshot and need not be repeated in every history point.
+    if let Some(map) = value.as_object_mut() {
+        for key in [
+            "os",
+            "arch",
+            "kernel_version",
+            "cpu_info",
+            "cpu_cores",
+            "boot_time",
+            "ip_v4",
+            "ip_v6",
+        ] {
+            map.remove(key);
+        }
+    }
+    value
 }
 
 pub fn native_arch() -> &'static str {

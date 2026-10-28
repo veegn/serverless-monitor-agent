@@ -37,7 +37,7 @@ sequenceDiagram
     Note over Agent,DO: 阶段 2：无访客状态 (Idle Batch 节能模式)
     DO-->>CF: 无其他待处理事件时 DO 可进入 Hibernation
     loop 每 1s~2s 采样，本地缓冲
-        Agent->>Agent: 本地采集指标 -> 压入内存 RingBuffer
+        Agent->>Agent: 本地采集指标 -> 追加持久历史队列
     end
     Note over Agent,DO: 60s 定时器到期 (带 ±3s 随机 Jitter)
     Agent->>CF: 上行单帧 Batch 报文 { "batch": true, "samples": [30条采样...] }
@@ -294,8 +294,8 @@ sequenceDiagram
 * **字段与编码约束**：
   * `samples` 按时间戳由早到晚严格递增排序；
   * `samples` 数组长度建议控制在 $30 \sim 60$ 项（服务端单次请求硬上限 `UPDATE_MAX_BATCH_SAMPLES = 300`）；
-  * 单帧大小限制为 512KB（服务端上限 `UPDATE_MAX_REQUEST_BYTES = 524288`），日常 60 条样本仅约 15~20KB；
-  * `reportId` 是每次逻辑报告的唯一 ID；Agent 在发送前生成并随待确认报告持久保存，重发同一份报告时必须复用 ID 和完整内容。因 1009 缩小批次后，内容已改变，必须生成新 ID。
+  * 单帧大小限制为 512 KiB（服务端上限 `UPDATE_MAX_REQUEST_BYTES = 524288`），实际大小取决于历史指标字段数量，Agent 必须按序列化后的字节数限幅；
+  * `reportId` 是每次逻辑报告的唯一 ID。历史批次在发送前将 ID、完整报文和源样本持久保存，重发同一批次必须复用 ID 和完整内容；重启后继续该批次。因 1009 缩小批次后，内容已改变，必须生成新 ID。实时快照可以被更新的快照替代，替代时使用新 ID；被替代快照的迟到 ACK 不能清理任何历史样本。
   * 服务端以 `(id, reportId)` 做幂等处理。同一 ID、同一内容的重试返回原确认而不重复写入；同一 ID、不同内容必须拒绝。
   * `batch: true` 时，顶级 `metrics` 只更新“最新快照”；`samples` 才是历史采样点。除非服务端明确另有需求，不能把顶级 `metrics` 再作为一个 D1 历史点插入。
   * `persisted: true` 表示该批全部样本已持久化；`acceptedSamples` 必须等于请求中的样本数。拒绝、部分失败或持久化未完成时，返回 `accepted: false` 或 `persisted: false`，Agent 保留待发数据。
@@ -312,7 +312,7 @@ sequenceDiagram
 flowchart LR
     subgraph Runtime["Rust Agent Runtime"]
         Collector["Collector 采集器<br/>固定间隔采样"]
-        RingBuf[("Ring Buffer<br/>上限 300 条")]
+        RingBuf[("历史持久队列<br/>默认上限 5000 条")]
         Reporter["Reporter 传输调度器<br/>WebSocket 全双工收发"]
     end
     Collector -->|追加样本| RingBuf
@@ -347,14 +347,14 @@ pub struct ReporterState {
        - 唤醒调度器立即采集并发送第 1 次实时单帧上报，后续保持 2 秒循环。
      - 若 `hello.realtimeHint == false`（无访客）：
        - 探针**初始化为节能批量模式** `AdaptiveMode::IdleBatch { interval_ms: hello.next_wss_report_after_ms.unwrap_or(60_000) }`；
-       - 唤醒调度器立即发送一条 `batch:false` 的连接建立快照（更新最新状态、同步时钟与配置）；该帧不作为历史批量样本。收到其报告 ACK 后开始采样/批量周期。
+       - 唤醒调度器立即发送一条 `batch:false` 的连接建立快照（更新最新状态、同步时钟与配置）；该帧不作为历史批量样本。采样持续进行；收到其报告 ACK 后开始批量周期。
 
 2. **动态运行中的模式切换 (Server-push Mode ACK)**：
    - 在 WebSocket 读循环中持续监听 `type: "ack", ackFor: "mode"` 帧。普通报告 ACK 不改变模式：
      - **切入实时 (`realtimeHint: true`)**：
        - 当用户打开前端 Dashboard，服务端会**主动下行广播** `ack { ackFor: "mode", modeRevision: N, realtimeHint: true, nextWssReportAfterMs: 2000 }`；
        - 若此前处于 `IdleBatch`，立即将缓冲样本封存为待确认批次并发送；只有匹配 ACK 确认持久化后才可清理；
-       - 切换至 `AdaptiveMode::Realtime { interval_ms: 2000 }`；待确认批次发送后，从当前快照开始按实时间隔上报。不得把旧批次 ACK 当作模式推送处理。
+       - 切换至 `AdaptiveMode::Realtime { interval_ms: 2000 }` 并立即发送最新快照；实时快照和历史批次使用独立待确认槽位，批次 ACK 延迟不能阻塞实时更新。不得把旧批次 ACK 当作模式推送处理。
      - **回退节能 (`realtimeHint: false`)**：
        - 当最后一个 Dashboard 订阅者关闭时，服务端会**主动下行广播** `ack { ackFor: "mode", modeRevision: N, realtimeHint: false, nextWssReportAfterMs: 60000 }`；
        - 切换至 `AdaptiveMode::IdleBatch { interval_ms: 60000 }`。
@@ -362,10 +362,15 @@ pub struct ReporterState {
 3. **防并发惊群随机抖动（Jitter）**：
    - 仅在 `IdleBatch` 模式下加入均匀随机抖动：`delay = interval + U(-3000ms, +3000ms)`；最终 delay 不得小于采样间隔。每次成功确认后重新计算下一周期。实时模式不加抖动。
 
-### 4.3 内存与离线缓存边界
-- 在线待发送样本使用容量不超过 300 条的内存环形缓冲；按 2 秒采样时约覆盖 10 分钟。
-- WSS 断开后，样本必须转入主协议定义的持久化离线缓存，不能只依赖 300 条内存环形缓冲。该内存上限不是断网保留策略。
-- 持久化缓存的容量、淘汰和剩余可保留时长按 [主协议第 5.2 节](PROTOCOL.md#52-本地缓存文件格式) 执行；服务端确认前不得从本地删除对应样本。
+### 4.3 采样、队列与恢复边界
+- 在线实时、在线节能和断线期间都按 2 秒独立采样，采样完成即追加到 JSONL 历史队列；历史指标包括 CPU、内存、Swap、磁盘容量/IO、负载、网络计数/速率、进程/连接数及探测 RTT/丢包率，主机静态身份放在顶级 `metrics`。
+- 默认保留 5000 条记录，按 2 秒一条约覆盖 2.78 小时。容量、FIFO 淘汰和路径按 [主协议第 5.2 节](PROTOCOL.md#52-本地缓存文件格式) 执行。
+- 每批最多读取 50 条；只有匹配 `reportId`、`accepted:true`、`persisted:true` 和完整样本数后，才按源样本身份推进队列。旧 ACK、重复 ACK、容量淘汰后的 ACK 均不得删除新样本。
+- 实时快照按模式间隔发送；历史队列独立约每 60 秒封装批次。连接恢复或进入实时模式时触发历史补报；有至少一个完整批次积压时，在上一批确认后以 100 毫秒间隔继续补报，避免历史 ACK 阻塞最新状态。
+- 历史待确认报文保存在 `metrics_cache.dat.pending`，内容未改变的重试不重复写盘。快照只保留最新待确认项，历史样本已独立入队，允许更新快照替代较旧快照。
+- 缓存启动和追加会修复截断尾行，计数、读取和确认使用相同的有效 JSON 样本规则；运行期读写错误必须记录，不能将读取错误解释为空队列。
+- WebSocket 由单一连接线程读写，生产者通过最多 8 帧、总计 2 MiB 的有界队列提交报文；本地入队成功不能替代服务端 ACK。解析器跨轮询保存半帧和分片消息的读取进度。
+- 使用单调时钟计算最近的采样、上报和重试截止时间，支持 1 秒实时周期。系统动态指标每次现场采集；静态系统身份缓存，GPU 工具在独立线程按 30 秒周期采集。月流量每次观测在内存累加、每 30 秒写检查点；异常退出可能丢失尚未写入检查点的增量。
 
 ### 4.4 紧急告警即刻打断机制 (Emergency Interrupt)
 紧急告警属于自适应上报之外的扩展。本规范暂不定义 CPU/RAM 阈值、持续时间、恢复条件或告警报文字段；服务端和 Agent 在这些内容另行定稿前不得将普通 `batch:false` 帧解释为告警。
@@ -386,7 +391,7 @@ pub struct ReporterState {
 | **HTTP 409 + WSS 调度标头** | WSS 暂时关闭或未排期 | 服务端使用已定义的调度原因；Agent 按调度退避，不将其当作凭据错误。 |
 | **WS Close `1013` (Try Again Later)** | 服务端临时过载 | Agent 按 `5s → 10s → 30s → 60s` 退避；重复 1013 时持续递增，在成功完成一次报告确认后才重置。服务端可在 Close reason 中提供可诊断原因。 |
 | **WS Close `1009` (Message Too Big)** | 报文超限（> 512 KiB） | 服务端必须拒绝整批且不得部分持久化。Agent 保留样本，缩小到最新最多 30 条并再次按实际字节数限幅；缩小后的报告使用新 `reportId`。 |
-| **Socket 异常断连 / EOF** | 网络波动或超时断开 | Agent 继续采样并写入离线持久缓存；重连后按确认机制分批补报。300 条内存环形缓冲不是离线持久化的替代品。 |
+| **Socket 异常断连 / EOF** | 网络波动或超时断开 | Agent 继续采样并写入离线持久缓存；重连后按确认机制分批补报。所有模式共用持久历史队列，历史确认与实时快照独立。 |
 
 ## 6. 服务端实施要求
 
@@ -395,7 +400,7 @@ pub struct ReporterState {
 3. **广播与分片**：若不同节点或小规模节点组使用独立 DO，服务端应由看板聚合层负责跨分片订阅与实时广播；若使用共享 DO，应测量 Agent 批次到达率、最长空闲窗口、DO Duration 与 D1 写入成本。不得在未经压测时承诺固定的成本降幅。
 4. **批量持久化**：验证 `reportId`、节点身份、样本数量、时间戳顺序和总字节数；对每个 `(id, reportId)` 进行幂等处理，并在一个事务边界内完成整批样本写入。重复且内容一致的请求返回相同成功 ACK，不重复插入；相同 ID 内容不一致时拒绝。为覆盖 Agent 重启或重新分批后的重叠样本，历史表还应对 `(id, sample.ts)` 建立唯一性约束；相同时间戳、不同指标内容应拒绝并记录冲突。
 5. **ACK 与状态推送**：只用 `ackFor:"report"` 确认上报；只用 `ackFor:"mode"` 推送模式。报告 ACK 必须回显 `reportId`；批量成功时 `acceptedSamples` 必须等于请求数并且 `persisted:true`。模式推送必须包含递增 `modeRevision`、`realtimeHint` 和 `nextWssReportAfterMs`，不得附带报告持久化确认字段。
-6. **帧处理**：`batch:false` 更新最新快照并实时广播；`batch:true` 的顶级 `metrics` 更新最新快照，`samples` 写入历史库。除非产品明确规定，不得把顶级 `metrics` 再写成一个历史点。服务端应原子拒绝超限帧，不得产生部分写入。
+6. **帧处理**：`batch:false` 更新最新快照并实时广播；`batch:true` 的顶级 `metrics` 更新最新快照，`samples` 写入历史库。服务端必须按报告观测时间比较最新状态，迟到或重试的历史批次不得覆盖更新的实时快照。除非产品明确规定，不得把顶级 `metrics` 再写成一个历史点。服务端应原子拒绝超限帧，不得产生部分写入。
 7. **时间与间隔**：`ts`、`time.local_ts` 均为 Unix epoch 毫秒。模式帧的 `nextWssReportAfterMs` 是从 Agent 收到该模式帧时开始计算的后续上报间隔，必须在 1000–300000ms 范围内；缺省时实时使用 2000ms、节能使用 60000ms。首个连接快照立即发送。服务端不得用普通报告 ACK 覆盖模式计时。
 8. **配置兼容**：模式调度字段优先于静态 `report_interval`；后者用于 HTTP/旧版路径及管理配置展示。`wss_report_interval` 只能作为实时模式的默认值，不能覆盖服务端当前模式推送。服务端下发配置时使用主协议定义的 schema 和 MD5。
 

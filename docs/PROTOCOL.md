@@ -255,7 +255,7 @@ sequenceDiagram
     Agent->xServer: WSS 断开 / 发送失败 / 网络中断
     Note over Agent: 探测到服务端不可用<br/>触发离线暂存机制
     Agent->>LocalDisk: 追加当前采样指标 (JSON Lines 格式)
-    Note over Agent: 进入退避重连周期 (60s -> 300s)<br/>后台采样继续累积写入本地磁盘缓存
+    Note over Agent: 进入指数退避重连周期<br/>后台按 2 秒继续采样并追加历史队列
 
     Note over Agent: WSS 重连成功
     Agent->>Server: WSS 建立连接 (Hello / Ack 握手成功)
@@ -265,12 +265,12 @@ sequenceDiagram
         Agent->>Server: WSS Text Frame (batch: true, samples: [50项])
         Agent->>LocalDisk: 裁剪移除已确认上报的 50 条记录
     end
-    Note over Agent: 缓存清理完毕，恢复正常实时上报模式
+    Note over Agent: 实时快照与历史补报独立调度，补报等待不阻塞看板更新
 ```
 
 ### 5.2 本地缓存文件格式
 - **路径**：`~/.sma/metrics_cache.dat`（普通用户）或 `/usr/local/etc/sma/metrics_cache.dat`（系统服务）。
-- **格式**：JSON Lines（每行一个自包含 JSON 对象，具备极高的追加与崩溃安全性）。
+- **格式**：JSON Lines，每行一个独立 JSON 样本；在线、空闲和断线采样共用队列。启动及追加时修复截断尾行，计数和确认统一按有效样本处理。
 - **单行结构**：
 ```json
 {"ts":1729700060000,"metrics":{"cpu":"15.20","ram_total":"8192","ram_used":"1600","swap_total":"2048","swap_used":"0","net_in_speed":"45000","net_out_speed":"32000"}}

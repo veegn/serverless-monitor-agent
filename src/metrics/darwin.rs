@@ -2,7 +2,7 @@ use crate::metrics::common::*;
 use crate::types::*;
 use std::ffi::{CStr, CString};
 use std::mem::{size_of, MaybeUninit};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 #[derive(Clone, Copy)]
 struct CpuTimes {
@@ -60,16 +60,21 @@ pub fn collect_basic_stats() -> BasicStats {
     let (memory, _) = read_memory_stats();
     let (disk_total_mb, disk_used_mb) = darwin_disk_usage("/");
     let cores = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as usize;
-    let kernel = sysctl_string("kern.osrelease").unwrap_or_else(|| "Darwin".to_string());
-    let product_version = sysctl_string("kern.osproductversion").unwrap_or_default();
-    let os_name = if product_version.is_empty() {
-        "macOS".to_string()
-    } else {
-        format!("macOS {}", product_version)
-    };
-    let cpu_info = sysctl_string("machdep.cpu.brand_string")
-        .or_else(|| sysctl_string("hw.model"))
-        .unwrap_or_else(|| native_arch().to_string());
+    static IDENTITY: OnceLock<(String, String, String)> = OnceLock::new();
+    let identity = IDENTITY.get_or_init(|| {
+        let kernel = sysctl_string("kern.osrelease").unwrap_or_else(|| "Darwin".to_string());
+        let product_version = sysctl_string("kern.osproductversion").unwrap_or_default();
+        let os_name = if product_version.is_empty() {
+            "macOS".to_string()
+        } else {
+            format!("macOS {}", product_version)
+        };
+        let cpu_info = sysctl_string("machdep.cpu.brand_string")
+            .or_else(|| sysctl_string("hw.model"))
+            .unwrap_or_else(|| native_arch().to_string());
+
+        (os_name, kernel, cpu_info)
+    });
 
     BasicStats {
         mem_total_mb: memory.mem_total_mb,
@@ -81,10 +86,10 @@ pub fn collect_basic_stats() -> BasicStats {
         disk_devices: Vec::new(),
         load_avg: darwin_load_avg(),
         boot_time_ms: darwin_boot_time_ms(),
-        os_name,
+        os_name: identity.0.clone(),
         arch: native_arch().to_string(),
-        kernel,
-        cpu_info,
+        kernel: identity.1.clone(),
+        cpu_info: identity.2.clone(),
         cpu_cores: cores,
         gpu_info: darwin_gpu_info(),
         processes: darwin_process_count(),
@@ -208,11 +213,9 @@ fn darwin_disk_usage(mount: &str) -> (u64, u64) {
         return (0, 0);
     }
     let stat = unsafe { stat.assume_init() };
-    let Some((total, used)) = disk_usage_mb_from_blocks(
-        stat.f_blocks as u64,
-        stat.f_bfree as u64,
-        stat.f_bsize as i64,
-    ) else {
+    let Some((total, used)) =
+        disk_usage_mb_from_blocks(stat.f_blocks, stat.f_bfree, stat.f_bsize as i64)
+    else {
         return (0, 0);
     };
     (total, used)

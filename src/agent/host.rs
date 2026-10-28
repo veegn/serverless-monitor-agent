@@ -216,6 +216,7 @@ impl TransportHost for Agent {
             initial
         ));
         drop(adaptive);
+        self.update_reporting_mode(realtime, initial, now);
         self.wake_tick();
         true
     }

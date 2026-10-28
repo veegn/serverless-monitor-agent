@@ -1,7 +1,7 @@
 use crate::metrics::common::*;
 use crate::types::*;
 use std::mem::{size_of, zeroed};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, FILETIME, NO_ERROR};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     FreeMibTable, GetExtendedTcpTable, GetExtendedUdpTable, GetIfTable2, MIB_IF_ROW2,
@@ -61,6 +61,26 @@ pub fn collect_basic_stats() -> BasicStats {
     let mut system_info: SYSTEM_INFO = unsafe { zeroed() };
     unsafe { GetSystemInfo(&mut system_info) };
 
+    static IDENTITY: OnceLock<(String, String, String)> = OnceLock::new();
+    let identity = IDENTITY.get_or_init(|| {
+        (
+            registry_string(
+                "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+                "ProductName",
+            )
+            .unwrap_or_else(|| "Microsoft Windows".to_string()),
+            registry_string(
+                "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+                "CurrentBuildNumber",
+            )
+            .unwrap_or_else(|| "Windows".to_string()),
+            registry_string(
+                "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                "ProcessorNameString",
+            )
+            .unwrap_or_else(|| native_arch().to_string()),
+        )
+    });
     BasicStats {
         mem_total_mb: memory.mem_total_mb,
         mem_used_mb: memory.mem_used_mb,
@@ -71,22 +91,10 @@ pub fn collect_basic_stats() -> BasicStats {
         disk_devices: Vec::new(),
         load_avg: "0 0 0".to_string(),
         boot_time_ms: windows_boot_time_ms(),
-        os_name: registry_string(
-            "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
-            "ProductName",
-        )
-        .unwrap_or_else(|| "Microsoft Windows".to_string()),
+        os_name: identity.0.clone(),
         arch: native_arch().to_string(),
-        kernel: registry_string(
-            "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
-            "CurrentBuildNumber",
-        )
-        .unwrap_or_else(|| "Windows".to_string()),
-        cpu_info: registry_string(
-            "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
-            "ProcessorNameString",
-        )
-        .unwrap_or_else(|| native_arch().to_string()),
+        kernel: identity.1.clone(),
+        cpu_info: identity.2.clone(),
         cpu_cores: system_info.dwNumberOfProcessors as usize,
         gpu_info: windows_gpu_info(),
         processes: windows_process_count(),
@@ -259,8 +267,7 @@ fn tcp_table_count(address_family: u32) -> usize {
                         .add(4 + index * row_size)
                         .cast::<MIB_TCPROW_OWNER_PID>()
                 };
-                (unsafe { std::ptr::read_unaligned(ptr).dwState })
-                    == MIB_TCP_STATE_ESTAB as u32
+                (unsafe { std::ptr::read_unaligned(ptr).dwState }) == MIB_TCP_STATE_ESTAB as u32
             })
             .count()
     } else {
@@ -273,8 +280,7 @@ fn tcp_table_count(address_family: u32) -> usize {
                         .add(4 + index * row_size)
                         .cast::<MIB_TCP6ROW_OWNER_PID>()
                 };
-                (unsafe { std::ptr::read_unaligned(ptr).dwState })
-                    == MIB_TCP_STATE_ESTAB as u32
+                (unsafe { std::ptr::read_unaligned(ptr).dwState }) == MIB_TCP_STATE_ESTAB as u32
             })
             .count()
     }

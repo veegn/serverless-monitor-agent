@@ -3,7 +3,7 @@ use crate::types::*;
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::mem::{size_of, MaybeUninit};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 #[derive(Clone, Copy)]
 struct CpuTimes {
@@ -38,6 +38,13 @@ pub fn collect_basic_stats() -> BasicStats {
     let (memory, _) = read_memory_stats();
     let (disk_total_mb, disk_used_mb) = freebsd_disk_usage();
     let cores = sysctl_value::<libc::c_int>("hw.ncpu").unwrap_or(1).max(1) as usize;
+    static IDENTITY: OnceLock<(String, String)> = OnceLock::new();
+    let identity = IDENTITY.get_or_init(|| {
+        (
+            sysctl_string("kern.osrelease").unwrap_or_else(|| "FreeBSD".to_string()),
+            sysctl_string("hw.model").unwrap_or_else(|| native_arch().to_string()),
+        )
+    });
     BasicStats {
         mem_total_mb: memory.mem_total_mb,
         mem_used_mb: memory.mem_used_mb,
@@ -50,8 +57,8 @@ pub fn collect_basic_stats() -> BasicStats {
         boot_time_ms: freebsd_boot_time_ms(),
         os_name: "FreeBSD".to_string(),
         arch: native_arch().to_string(),
-        kernel: sysctl_string("kern.osrelease").unwrap_or_else(|| "FreeBSD".to_string()),
-        cpu_info: sysctl_string("hw.model").unwrap_or_else(|| native_arch().to_string()),
+        kernel: identity.0.clone(),
+        cpu_info: identity.1.clone(),
         cpu_cores: cores,
         gpu_info: detect_gpu_info(),
         processes: freebsd_process_count(),

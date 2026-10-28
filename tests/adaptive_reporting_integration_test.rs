@@ -340,3 +340,92 @@ fn read_client_text_frame(stream: &mut TcpStream) -> String {
     }
     String::from_utf8(payload).expect("client payload is UTF-8 JSON")
 }
+
+#[path = "support/websocket.rs"]
+mod ws;
+
+#[test]
+fn partial_headers_payloads_and_fragmented_messages_survive_poll_timeouts() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (done, finish) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let mut stream = ws::accept(&listener);
+        ws::hello(&mut stream, true, 2000);
+        let ack = serde_json::to_vec(&serde_json::json!({
+            "type":"ack", "ackFor":"report", "reportId":"fragmented-report",
+            "accepted":true, "persisted":true, "acceptedSamples":2,
+            "padding":"enough bytes to exercise the extended payload length path",
+        }))
+        .unwrap();
+        let first = ws::frame(1, false, &ack[..ack.len() - 8]);
+        // Split the header and then the payload across multiple socket polls.
+        stream.write_all(&first[..1]).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        stream.write_all(&first[1..6]).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        stream.write_all(&first[6..]).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        stream.write_all(&ws::frame(9, true, b"ping")).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        stream
+            .write_all(&ws::frame(0, true, &ack[ack.len() - 8..]))
+            .unwrap();
+        finish.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+    let host = Arc::new(MockHost::new(format!("http://{address}/update")));
+    let transport = ReportTransport::new(host.clone());
+    transport.start();
+    ws::wait_until(|| !host.report_acks.lock().unwrap().is_empty());
+    assert_eq!(
+        host.report_acks.lock().unwrap()[0].report_id,
+        "fragmented-report"
+    );
+    assert_eq!(
+        host.report_acks.lock().unwrap()[0].accepted_samples,
+        Some(2)
+    );
+    transport.stop("test complete");
+    done.send(()).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn enqueue_and_stop_do_not_wait_for_a_server_data_frame() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (received, receive) = std::sync::mpsc::channel();
+    let (done, finish) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let mut stream = ws::accept(&listener);
+        ws::hello(&mut stream, true, 2000);
+        received.send(ws::read_json(&mut stream)).unwrap();
+        finish.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+    let host = Arc::new(MockHost::new(format!("http://{address}/update")));
+    let transport = ReportTransport::new(host);
+    transport.start();
+    ws::wait_until(|| transport.connected());
+    assert!(
+        !transport.send(&vec![0; 2 * 1024 * 1024 + 1]),
+        "outbound memory is bounded"
+    );
+    let start = Instant::now();
+    assert!(transport.send(br#"{"reportId":"nonblocking-send"}"#));
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "enqueue waited for socket I/O"
+    );
+    assert_eq!(
+        receive.recv_timeout(Duration::from_secs(5)).unwrap()["reportId"],
+        "nonblocking-send"
+    );
+    let start = Instant::now();
+    transport.stop("test complete");
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "stop waited for socket I/O"
+    );
+    done.send(()).unwrap();
+    server.join().unwrap();
+}

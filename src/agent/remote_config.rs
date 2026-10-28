@@ -10,8 +10,8 @@ use crate::storage::config::{
 };
 use crate::storage::traffic::{apply_traffic_correction_from_network, parse_traffic_correction_gb};
 use crate::types::{
-    Config, CONFIG_SCHEMA_VERSION, CONNECTION_MODE_AUTO, DEFAULT_WSS_REPORT_INTERVAL_SEC,
-    DiskIOCounters, DiskIOStats, MAX_WSS_REPORT_INTERVAL_SEC, MIN_WSS_REPORT_INTERVAL_SEC,
+    Config, DiskIOCounters, DiskIOStats, CONFIG_SCHEMA_VERSION, CONNECTION_MODE_AUTO,
+    DEFAULT_WSS_REPORT_INTERVAL_SEC, MAX_WSS_REPORT_INTERVAL_SEC, MIN_WSS_REPORT_INTERVAL_SEC,
 };
 
 use super::Agent;
@@ -48,7 +48,11 @@ pub fn remote_config_differs(
 }
 
 impl Agent {
-    pub fn apply_remote_config(&self, body: &[u8], headers: &HashMap<String, String>) -> Result<(), String> {
+    pub fn apply_remote_config(
+        &self,
+        body: &[u8],
+        headers: &HashMap<String, String>,
+    ) -> Result<(), String> {
         self.apply_remote_config_with_options(body, headers, false)
     }
 
@@ -81,10 +85,25 @@ impl Agent {
         }
 
         let allowed = [
-            "collect_interval", "report_interval", "wss_report_interval", "reset_day",
-            "schema_version", "custom_ct", "custom_cu", "custom_cm", "custom_bd",
-            "node_1", "node_2", "node_3", "node_4", "interface", "connection_mode",
-            "ping_mode", "rx_correction", "tx_correction", "update",
+            "collect_interval",
+            "report_interval",
+            "wss_report_interval",
+            "reset_day",
+            "schema_version",
+            "custom_ct",
+            "custom_cu",
+            "custom_cm",
+            "custom_bd",
+            "node_1",
+            "node_2",
+            "node_3",
+            "node_4",
+            "interface",
+            "connection_mode",
+            "ping_mode",
+            "rx_correction",
+            "tx_correction",
+            "update",
         ];
         for k in values.keys() {
             if !allowed.contains(&k.as_str()) {
@@ -111,14 +130,29 @@ impl Agent {
             || values.contains_key("node_3")
             || values.contains_key("node_4");
 
-        let has_correction = values.contains_key("rx_correction") || values.contains_key("tx_correction");
+        let has_correction =
+            values.contains_key("rx_correction") || values.contains_key("tx_correction");
         let cfg = self.config_snapshot();
 
         if !has_config {
             if has_correction {
                 let rx = values.get("rx_correction").cloned().unwrap_or_default();
                 let tx = values.get("tx_correction").cloned().unwrap_or_default();
-                apply_traffic_correction_from_network(&self.paths.traffic_file, &cfg.interface, &rx, &tx)?;
+                {
+                    let mut traffic = self.traffic.lock().unwrap();
+                    if let Some(tracker) = traffic.as_ref() {
+                        tracker
+                            .checkpoint(&self.paths.traffic_file)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    apply_traffic_correction_from_network(
+                        &self.paths.traffic_file,
+                        &cfg.interface,
+                        &rx,
+                        &tx,
+                    )?;
+                    *traffic = None;
+                }
                 let _ = self.send_correction_confirm(&cfg, &rx, &tx);
                 return Ok(());
             }
@@ -139,10 +173,22 @@ impl Agent {
             return Err("invalid remote md5".to_string());
         }
 
-        let collect = values.get("collect_interval").and_then(|s| s.parse::<i32>().ok()).unwrap_or(-1);
-        let report = values.get("report_interval").and_then(|s| s.parse::<i32>().ok()).unwrap_or(-1);
-        let wss_report = values.get("wss_report_interval").and_then(|s| s.parse::<i32>().ok()).unwrap_or(DEFAULT_WSS_REPORT_INTERVAL_SEC as i32);
-        let reset = values.get("reset_day").and_then(|s| s.parse::<i32>().ok()).unwrap_or(-1);
+        let collect = values
+            .get("collect_interval")
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(-1);
+        let report = values
+            .get("report_interval")
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(-1);
+        let wss_report = values
+            .get("wss_report_interval")
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(DEFAULT_WSS_REPORT_INTERVAL_SEC as i32);
+        let reset = values
+            .get("reset_day")
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(-1);
 
         if ![0, 1, 2, 5, 10].contains(&collect) {
             return Err(format!("invalid collect_interval {}", collect));
@@ -150,22 +196,34 @@ impl Agent {
         if ![30, 60, 120, 180].contains(&report) {
             return Err(format!("invalid report_interval {}", report));
         }
-        if !(MIN_WSS_REPORT_INTERVAL_SEC as i32..=MAX_WSS_REPORT_INTERVAL_SEC as i32).contains(&wss_report) {
+        if !(MIN_WSS_REPORT_INTERVAL_SEC as i32..=MAX_WSS_REPORT_INTERVAL_SEC as i32)
+            .contains(&wss_report)
+        {
             return Err(format!("invalid wss_report_interval {}", wss_report));
         }
         if !(0..=31).contains(&reset) {
             return Err(format!("invalid reset_day {}", reset));
         }
         if values.get("schema_version").map(|s| s.as_str()) != Some(CONFIG_SCHEMA_VERSION) {
-            return Err(format!("invalid schema_version {:?}", values.get("schema_version")));
+            return Err(format!(
+                "invalid schema_version {:?}",
+                values.get("schema_version")
+            ));
         }
         if report < collect {
             return Err("report_interval less than collect_interval".to_string());
         }
 
-        let iface = normalize_interface_list(values.get("interface").map(|s| s.as_str()).unwrap_or(""))?;
-        let connection_mode = normalize_connection_mode(values.get("connection_mode").map(|s| s.as_str()).unwrap_or(""))?;
-        let ping_mode = normalize_ping_mode(values.get("ping_mode").map(|s| s.as_str()).unwrap_or(""))?;
+        let iface =
+            normalize_interface_list(values.get("interface").map(|s| s.as_str()).unwrap_or(""))?;
+        let connection_mode = normalize_connection_mode(
+            values
+                .get("connection_mode")
+                .map(|s| s.as_str())
+                .unwrap_or(""),
+        )?;
+        let ping_mode =
+            normalize_ping_mode(values.get("ping_mode").map(|s| s.as_str()).unwrap_or(""))?;
 
         let mut effective_collect = collect;
         if connection_mode == CONNECTION_MODE_AUTO && (collect == 0 || collect > wss_report) {
@@ -175,7 +233,16 @@ impl Agent {
         let should_apply = if has_remote_md5 {
             new_md5 != cfg.config_md5
         } else {
-            remote_config_differs(&cfg, &values, effective_collect, report, reset, &iface, &connection_mode, &ping_mode)
+            remote_config_differs(
+                &cfg,
+                &values,
+                effective_collect,
+                report,
+                reset,
+                &iface,
+                &connection_mode,
+                &ping_mode,
+            )
         };
 
         if should_apply {
@@ -183,14 +250,30 @@ impl Agent {
             next_cfg.collect_interval = effective_collect as u64;
             next_cfg.report_interval = report as u64;
             next_cfg.reset_day = reset as u32;
-            if let Some(v) = values.get("custom_ct") { next_cfg.ct_node = v.clone(); }
-            if let Some(v) = values.get("custom_cu") { next_cfg.cu_node = v.clone(); }
-            if let Some(v) = values.get("custom_cm") { next_cfg.cm_node = v.clone(); }
-            if let Some(v) = values.get("custom_bd") { next_cfg.bd_node = v.clone(); }
-            if let Some(v) = values.get("node_1") { next_cfg.node_1 = v.clone(); }
-            if let Some(v) = values.get("node_2") { next_cfg.node_2 = v.clone(); }
-            if let Some(v) = values.get("node_3") { next_cfg.node_3 = v.clone(); }
-            if let Some(v) = values.get("node_4") { next_cfg.node_4 = v.clone(); }
+            if let Some(v) = values.get("custom_ct") {
+                next_cfg.ct_node = v.clone();
+            }
+            if let Some(v) = values.get("custom_cu") {
+                next_cfg.cu_node = v.clone();
+            }
+            if let Some(v) = values.get("custom_cm") {
+                next_cfg.cm_node = v.clone();
+            }
+            if let Some(v) = values.get("custom_bd") {
+                next_cfg.bd_node = v.clone();
+            }
+            if let Some(v) = values.get("node_1") {
+                next_cfg.node_1 = v.clone();
+            }
+            if let Some(v) = values.get("node_2") {
+                next_cfg.node_2 = v.clone();
+            }
+            if let Some(v) = values.get("node_3") {
+                next_cfg.node_3 = v.clone();
+            }
+            if let Some(v) = values.get("node_4") {
+                next_cfg.node_4 = v.clone();
+            }
             next_cfg.interface = iface.clone();
             next_cfg.connection_mode = connection_mode;
             next_cfg.ping_mode = ping_mode;
@@ -221,7 +304,11 @@ impl Agent {
 
             self.log.info(&format!(
                 "dynamic configuration applied md5={} connection_mode={} ping_mode={} interface={}",
-                if next_cfg.config_md5.is_empty() { "none" } else { &next_cfg.config_md5 },
+                if next_cfg.config_md5.is_empty() {
+                    "none"
+                } else {
+                    &next_cfg.config_md5
+                },
                 next_cfg.connection_mode,
                 next_cfg.ping_mode,
                 if iface.is_empty() { "auto" } else { &iface }
@@ -231,14 +318,33 @@ impl Agent {
         if has_correction {
             let rx = values.get("rx_correction").cloned().unwrap_or_default();
             let tx = values.get("tx_correction").cloned().unwrap_or_default();
-            apply_traffic_correction_from_network(&self.paths.traffic_file, &cfg.interface, &rx, &tx)?;
+            {
+                let mut traffic = self.traffic.lock().unwrap();
+                if let Some(tracker) = traffic.as_ref() {
+                    tracker
+                        .checkpoint(&self.paths.traffic_file)
+                        .map_err(|error| error.to_string())?;
+                }
+                apply_traffic_correction_from_network(
+                    &self.paths.traffic_file,
+                    &cfg.interface,
+                    &rx,
+                    &tx,
+                )?;
+                *traffic = None;
+            }
             let _ = self.send_correction_confirm(&cfg, &rx, &tx);
         }
 
         Ok(())
     }
 
-    pub(super) fn send_correction_confirm(&self, cfg: &Config, rx: &str, tx: &str) -> Result<(), String> {
+    pub(super) fn send_correction_confirm(
+        &self,
+        cfg: &Config,
+        rx: &str,
+        tx: &str,
+    ) -> Result<(), String> {
         let _ = parse_traffic_correction_gb(rx)?;
         let _ = parse_traffic_correction_gb(tx)?;
         let rx_val: f64 = rx.trim().parse().unwrap_or(0.0);

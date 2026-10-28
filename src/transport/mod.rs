@@ -24,7 +24,7 @@ pub use schedule::{
 };
 pub use url::{report_websocket_url, report_websocket_url_with_config};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -95,7 +95,7 @@ struct Inner {
 pub struct ReportTransport {
     host: Arc<dyn TransportHost>,
     inner: Arc<Mutex<Inner>>,
-    conn: Arc<Mutex<Option<WebSocketConn>>>,
+    outbound: Arc<Mutex<VecDeque<Vec<u8>>>>,
     connected: Arc<AtomicBool>,
     wake_cv: Arc<Condvar>,
     shutdown: Arc<AtomicBool>,
@@ -127,7 +127,7 @@ impl ReportTransport {
                 auth_failed: false,
                 server_overload_attempt: 0,
             })),
-            conn: Arc::new(Mutex::new(None)),
+            outbound: Arc::new(Mutex::new(VecDeque::new())),
             connected: Arc::new(AtomicBool::new(false)),
             wake_cv: Arc::new(Condvar::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -220,8 +220,7 @@ impl ReportTransport {
         inner.pause_reason.clear();
         drop(inner);
 
-        let mut guard = self.conn.lock().unwrap();
-        let _ = guard.take();
+        self.outbound.lock().unwrap().clear();
         self.connected.store(false, AtomicOrdering::SeqCst);
 
         self.wake_cv.notify_all();
@@ -240,27 +239,27 @@ impl ReportTransport {
         self.connected.load(AtomicOrdering::SeqCst)
     }
 
+    /// Queue a frame for the connection thread. Acceptance is not a server ACK.
     pub fn send(&self, body: &[u8]) -> bool {
-        if !self.connected.load(AtomicOrdering::SeqCst) {
+        const MAX_QUEUED_FRAMES: usize = 8;
+        const MAX_QUEUED_BYTES: usize = 2 * 1024 * 1024;
+        let inner = self.inner.lock().unwrap();
+        if !self.connected()
+            || inner.stopped
+            || inner
+                .pause_until
+                .is_some_and(|until| Instant::now() < until)
+        {
             return false;
         }
+        let mut outbound = self.outbound.lock().unwrap();
+        if outbound.len() >= MAX_QUEUED_FRAMES
+            || outbound.iter().map(Vec::len).sum::<usize>() + body.len() > MAX_QUEUED_BYTES
         {
-            let inner = self.inner.lock().unwrap();
-            if let Some(until) = inner.pause_until {
-                if Instant::now() < until {
-                    return false;
-                }
-            }
+            return false;
         }
-        let mut guard = self.conn.lock().unwrap();
-        if let Some(conn) = guard.as_mut() {
-            if conn.write_text(body, WSS_WRITE_TIMEOUT).is_ok() {
-                return true;
-            }
-            let _ = guard.take();
-            self.connected.store(false, AtomicOrdering::SeqCst);
-        }
-        false
+        outbound.push_back(body.to_vec());
+        true
     }
 
     pub fn delay_protocol(&self, reason: &str) {
@@ -274,8 +273,7 @@ impl ReportTransport {
         inner.pause_reason = r.to_string();
         drop(inner);
 
-        let mut guard = self.conn.lock().unwrap();
-        let _ = guard.take();
+        self.outbound.lock().unwrap().clear();
         self.connected.store(false, AtomicOrdering::SeqCst);
 
         self.host.logger().info(&format!(
@@ -418,10 +416,6 @@ impl ReportTransport {
                     break;
                 }
             }
-            {
-                let mut guard = self.conn.lock().unwrap();
-                *guard = Some(conn);
-            }
             self.connected.store(true, AtomicOrdering::SeqCst);
 
             self.host.logger().info(&format!(
@@ -431,12 +425,9 @@ impl ReportTransport {
             self.host.note_report_success();
             self.host.wake_tick();
 
-            let err = self.read_loop();
-            {
-                let mut guard = self.conn.lock().unwrap();
-                let _ = guard.take();
-            }
+            let err = self.read_loop(&mut conn);
             self.connected.store(false, AtomicOrdering::SeqCst);
+            self.outbound.lock().unwrap().clear();
             self.host.wake_tick();
 
             if !self.should_run() {
@@ -532,24 +523,24 @@ impl ReportTransport {
         Ok(hello)
     }
 
-    fn read_loop(&self) -> Option<WsError> {
+    fn read_loop(&self, conn: &mut WebSocketConn) -> Option<WsError> {
         let mut last_activity = Instant::now();
         let mut last_ping = Instant::now();
-        let short_poll = Duration::from_millis(100);
+        let short_poll = Duration::from_millis(25);
 
         loop {
             if !self.should_run() {
                 return None;
             }
 
-            // Sync connection-level activity (e.g. Ping/Pong/Data frames received)
-            {
-                let guard = self.conn.lock().unwrap();
-                if let Some(ref conn) = *guard {
-                    let conn_act = conn.last_activity();
-                    if conn_act > last_activity {
-                        last_activity = conn_act;
-                    }
+            last_activity = last_activity.max(conn.last_activity());
+            // Socket I/O belongs exclusively to this thread. Producers only
+            // hold the queue lock long enough to enqueue or dequeue one frame.
+            loop {
+                let body = self.outbound.lock().unwrap().pop_front();
+                let Some(body) = body else { break };
+                if let Err(error) = conn.write_text(&body, WSS_WRITE_TIMEOUT) {
+                    return Some(error);
                 }
             }
 
@@ -563,29 +554,14 @@ impl ReportTransport {
 
             // RFC 6455 control Ping; Cloudflare responds without waking a hibernated DO.
             if last_ping.elapsed() >= WSS_HEARTBEAT_INTERVAL {
-                let mut guard = self.conn.lock().unwrap();
-                if let Some(ref mut conn) = *guard {
-                    if let Err(e) = conn.write_ping(b"", Duration::from_secs(4)) {
-                        return Some(e);
-                    }
+                if let Err(error) = conn.write_ping(b"", Duration::from_secs(4)) {
+                    return Some(error);
                 }
                 last_ping = Instant::now();
             }
 
-            let msg_res = {
-                let mut guard = self.conn.lock().unwrap();
-                let conn = match guard.as_mut() {
-                    Some(c) => c,
-                    None => {
-                        return Some(WsError::Io(std::io::Error::new(
-                            std::io::ErrorKind::ConnectionAborted,
-                            "connection closed by concurrent writer",
-                        )));
-                    }
-                };
-                let _ = conn.set_read_timeout(Some(short_poll));
-                conn.read_data_message()
-            };
+            let _ = conn.set_read_timeout(Some(short_poll));
+            let msg_res = conn.read_data_message();
             let (payload, opcode) = match msg_res {
                 Ok(res) => {
                     last_activity = Instant::now();
@@ -637,7 +613,9 @@ impl ReportTransport {
                                 frame.mode_revision,
                             ) {
                                 let interval_ms = interval_ms.clamp(1_000, 300_000);
-                                if self.host.apply_wss_mode(realtime, interval_ms, revision, false)
+                                if self
+                                    .host
+                                    .apply_wss_mode(realtime, interval_ms, revision, false)
                                 {
                                     self.set_next_report_after_ms(interval_ms as i64);
                                 }
@@ -686,7 +664,7 @@ impl ReportTransport {
                                 }
                             } else if let Some(interval_ms) = frame.next_wss_report_after_ms {
                                 self.set_next_report_after_ms(
-                                    interval_ms.clamp(1_000, 300_000) as i64,
+                                    interval_ms.clamp(1_000, 300_000) as i64
                                 );
                             }
                         }
@@ -937,7 +915,7 @@ impl Clone for ReportTransport {
         Self {
             host: self.host.clone(),
             inner: self.inner.clone(),
-            conn: self.conn.clone(),
+            outbound: self.outbound.clone(),
             connected: self.connected.clone(),
             wake_cv: self.wake_cv.clone(),
             shutdown: self.shutdown.clone(),

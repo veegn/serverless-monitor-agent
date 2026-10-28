@@ -140,7 +140,9 @@ fn test_period_start_ts_no_reset() {
 fn test_period_start_ts_clamps_reset_day() {
     let now = Local.with_ymd_and_hms(2026, 2, 15, 12, 0, 0).unwrap();
     let got_ts = period_start_ts(now, 31);
-    let got = DateTime::from_timestamp(got_ts, 0).unwrap().with_timezone(&Local);
+    let got = DateTime::from_timestamp(got_ts, 0)
+        .unwrap()
+        .with_timezone(&Local);
     let want = Local.with_ymd_and_hms(2026, 1, 31, 0, 0, 0).unwrap();
     assert_eq!(got, want);
 }
@@ -149,7 +151,9 @@ fn test_period_start_ts_clamps_reset_day() {
 fn test_period_start_ts_rolls_missing_reset_day_to_next_month() {
     let now = Local.with_ymd_and_hms(2026, 4, 30, 12, 0, 0).unwrap();
     let got_ts = period_start_ts(now, 31);
-    let got = DateTime::from_timestamp(got_ts, 0).unwrap().with_timezone(&Local);
+    let got = DateTime::from_timestamp(got_ts, 0)
+        .unwrap()
+        .with_timezone(&Local);
     let want = Local.with_ymd_and_hms(2026, 3, 31, 0, 0, 0).unwrap();
     assert_eq!(got, want);
 }
@@ -173,4 +177,60 @@ fn test_calc_monthly_traffic_basic() {
     assert_eq!(tx, 800);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_live_traffic_accumulates_between_coalesced_checkpoints() {
+    use serverless_monitor_agent::storage::traffic::{read_traffic_state, TrafficTracker};
+    let path = std::env::temp_dir().join(format!("sma-traffic-tracker-{}.dat", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let path = path.to_str().unwrap();
+    let mut tracker = TrafficTracker::new(path);
+    let now = std::time::Instant::now();
+    let date = chrono::Local::now();
+    tracker
+        .sample(
+            path,
+            NetBytes { rx: 100, tx: 200 },
+            0,
+            "eth-test",
+            date,
+            now,
+        )
+        .unwrap();
+    let on_disk = std::fs::read(path).unwrap();
+    assert_eq!(
+        tracker
+            .sample(
+                path,
+                NetBytes { rx: 150, tx: 270 },
+                0,
+                "eth-test",
+                date,
+                now + std::time::Duration::from_secs(1)
+            )
+            .unwrap(),
+        (50, 70)
+    );
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        on_disk,
+        "live observations must not rewrite the checkpoint each second"
+    );
+    assert_eq!(
+        tracker
+            .sample(
+                path,
+                NetBytes { rx: 180, tx: 300 },
+                0,
+                "eth-test",
+                date,
+                now + std::time::Duration::from_secs(31)
+            )
+            .unwrap(),
+        (80, 100)
+    );
+    let stored = read_traffic_state(path);
+    assert_eq!((stored.rx_period, stored.tx_period), (80, 100));
+    let _ = std::fs::remove_file(path);
 }

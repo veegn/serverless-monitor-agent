@@ -50,12 +50,6 @@ use crate::util::clock::CalibratedClock;
 use crate::util::command::run_command_quiet;
 use crate::util::log::Logger;
 
-#[derive(Debug, Clone)]
-pub(super) struct MetricSample {
-    pub(super) at: Instant,
-    pub(super) metrics: serde_json::Value,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AdaptiveMode {
     Realtime,
@@ -92,8 +86,6 @@ pub struct Agent {
     pub(super) log: Logger,
     pub(super) version: String,
     pub(super) discovery_failed: Arc<AtomicBool>,
-    pub(super) discovery_just_bound: Arc<AtomicBool>,
-    pub(super) discovery_sync_pending: Arc<AtomicBool>,
     pub(super) clock: Arc<Mutex<CalibratedClock>>,
     pub(super) probes: Arc<RwLock<ProbeSnapshot>>,
     pub(super) basic: Arc<RwLock<BasicStats>>,
@@ -104,12 +96,13 @@ pub struct Agent {
     pub(super) prev_disk: Mutex<DiskIOCounters>,
     pub(super) prev_disk_at: Mutex<Option<Instant>>,
     pub(super) disk_io: Mutex<DiskIOStats>,
+    pub(super) traffic: Mutex<Option<crate::storage::traffic::TrafficTracker>>,
     pub(super) monthly_rx: Mutex<u64>,
     pub(super) monthly_tx: Mutex<u64>,
-    pub(super) samples: Mutex<Vec<MetricSample>>,
     pub(super) adaptive_reporting: Mutex<AdaptiveReportingState>,
     pending_report_path: String,
-    pending_report: Mutex<Option<reporter::PendingReport>>,
+    reporting: Mutex<reporter::ReportingState>,
+    next_sample_due: Mutex<Instant>,
     pub(super) last_sample: Mutex<Option<Instant>>,
     pub(super) last_report: Mutex<Option<Instant>>,
     pub(super) last_config_state_report_at: Mutex<Option<Instant>>,
@@ -164,50 +157,7 @@ pub fn run(config_file: Option<&str>, debug: bool, version: &str) -> Result<(), 
     normalize_config_intervals(&mut cfg);
 
     let log = Logger::new(debug);
-    let pending_report_path = format!("{}.pending", paths.cache_file);
-    let restored_pending_report = reporter::restore_pending_report(&pending_report_path);
-    let agent = Arc::new(Agent {
-        cfg: Arc::new(RwLock::new(cfg.clone())),
-        paths: paths.clone(),
-        log: log.clone(),
-        version: version.to_string(),
-        discovery_failed: Arc::new(AtomicBool::new(false)),
-        discovery_just_bound: Arc::new(AtomicBool::new(false)),
-        discovery_sync_pending: Arc::new(AtomicBool::new(false)),
-        clock: Arc::new(Mutex::new(CalibratedClock::default())),
-        probes: Arc::new(RwLock::new(ProbeSnapshot::default())),
-        basic: Arc::new(RwLock::new(collect_basic_stats())),
-        basic_at: Mutex::new(Some(Instant::now())),
-        full_at: Mutex::new(None),
-        prev_net: Mutex::new(NetBytes::default()),
-        prev_time: Mutex::new(None),
-        prev_disk: Mutex::new(DiskIOCounters::default()),
-        prev_disk_at: Mutex::new(None),
-        disk_io: Mutex::new(DiskIOStats::default()),
-        monthly_rx: Mutex::new(0),
-        monthly_tx: Mutex::new(0),
-        samples: Mutex::new(Vec::new()),
-        adaptive_reporting: Mutex::new(AdaptiveReportingState::default()),
-        pending_report_path,
-        pending_report: Mutex::new(restored_pending_report),
-        last_sample: Mutex::new(None),
-        last_report: Mutex::new(None),
-        last_config_state_report_at: Mutex::new(None),
-        last_config_state_report_md5: Mutex::new(String::new()),
-        last_config_reject_key: Mutex::new(String::new()),
-        pending_persist_id: Mutex::new(String::new()),
-        report_failures: Mutex::new(0),
-        report_paused_until: Mutex::new(None),
-        report_backoff: Mutex::new(Duration::ZERO),
-        last_report_failure_at: Mutex::new(None),
-        wake_cv: Arc::new(Condvar::new()),
-        wake_mutex: Arc::new(Mutex::new(false)),
-        wss_runtime_disabled_at: Mutex::new(None),
-        wss_runtime_disabled_reason: Mutex::new(String::new()),
-        reporter: Mutex::new(None),
-        cache: Arc::new(Mutex::new(MetricsCache::new(&paths.cache_file))),
-        shutdown: Arc::new(AtomicBool::new(false)),
-    });
+    let agent = Arc::new(Agent::new(cfg.clone(), paths.clone(), log.clone(), version));
 
     agent.reset_network_baseline(&cfg.interface);
     let reporter = ReportTransport::new(agent.clone());
@@ -268,6 +218,59 @@ pub fn run(config_file: Option<&str>, debug: bool, version: &str) -> Result<(), 
 }
 
 impl Agent {
+    fn new(cfg: Config, paths: Paths, log: Logger, version: &str) -> Self {
+        let pending_report_path = format!("{}.pending", paths.cache_file);
+        let restored_reporting = reporter::restore_reporting_state(&pending_report_path)
+            .unwrap_or_else(|error| {
+                log.warn(&format!(
+                    "could not restore pending report: {}; historical samples remain queued",
+                    error
+                ));
+                reporter::ReportingState::default()
+            });
+        Self {
+            cfg: Arc::new(RwLock::new(cfg)),
+            paths: paths.clone(),
+            log: log.clone(),
+            version: version.to_string(),
+            discovery_failed: Arc::new(AtomicBool::new(false)),
+            clock: Arc::new(Mutex::new(CalibratedClock::default())),
+            probes: Arc::new(RwLock::new(ProbeSnapshot::default())),
+            basic: Arc::new(RwLock::new(collect_basic_stats())),
+            basic_at: Mutex::new(Some(Instant::now())),
+            full_at: Mutex::new(None),
+            prev_net: Mutex::new(NetBytes::default()),
+            prev_time: Mutex::new(None),
+            prev_disk: Mutex::new(DiskIOCounters::default()),
+            prev_disk_at: Mutex::new(None),
+            disk_io: Mutex::new(DiskIOStats::default()),
+            traffic: Mutex::new(None),
+            monthly_rx: Mutex::new(0),
+            monthly_tx: Mutex::new(0),
+            adaptive_reporting: Mutex::new(AdaptiveReportingState::default()),
+            pending_report_path,
+            reporting: Mutex::new(restored_reporting),
+            next_sample_due: Mutex::new(Instant::now()),
+            last_sample: Mutex::new(None),
+            last_report: Mutex::new(None),
+            last_config_state_report_at: Mutex::new(None),
+            last_config_state_report_md5: Mutex::new(String::new()),
+            last_config_reject_key: Mutex::new(String::new()),
+            pending_persist_id: Mutex::new(String::new()),
+            report_failures: Mutex::new(0),
+            report_paused_until: Mutex::new(None),
+            report_backoff: Mutex::new(Duration::ZERO),
+            last_report_failure_at: Mutex::new(None),
+            wake_cv: Arc::new(Condvar::new()),
+            wake_mutex: Arc::new(Mutex::new(false)),
+            wss_runtime_disabled_at: Mutex::new(None),
+            wss_runtime_disabled_reason: Mutex::new(String::new()),
+            reporter: Mutex::new(None),
+            cache: Arc::new(Mutex::new(MetricsCache::new(&paths.cache_file))),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     pub(super) fn config_snapshot(&self) -> Config {
         self.cfg.read().unwrap().clone()
     }
@@ -293,7 +296,8 @@ impl Agent {
             let timeout = self.tick_interval();
             let mut flag = self.wake_mutex.lock().unwrap();
             if !*flag {
-                let _ = self.wake_cv.wait_timeout(flag, timeout);
+                let (mut flag, _) = self.wake_cv.wait_timeout(flag, timeout).unwrap();
+                *flag = false;
             } else {
                 *flag = false;
             }

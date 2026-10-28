@@ -105,6 +105,9 @@ pub struct WebSocketConn {
     reader: BufReader<WsUnderlyingStream>,
     write_mu: Mutex<()>,
     last_activity: Instant,
+    incoming: Vec<u8>,
+    message: Vec<u8>,
+    message_opcode: u8,
 }
 
 pub fn dial_websocket(
@@ -118,10 +121,17 @@ pub fn dial_websocket(
     let is_tls = match scheme {
         "wss" => true,
         "ws" => false,
-        _ => return Err(WsError::Protocol(format!("unsupported WSS scheme {:?}", scheme))),
+        _ => {
+            return Err(WsError::Protocol(format!(
+                "unsupported WSS scheme {:?}",
+                scheme
+            )))
+        }
     };
 
-    let host = u.host_str().ok_or_else(|| WsError::Protocol("missing host".into()))?;
+    let host = u
+        .host_str()
+        .ok_or_else(|| WsError::Protocol("missing host".into()))?;
     let port = u.port().unwrap_or(if is_tls { 443 } else { 80 });
 
     let started = Instant::now();
@@ -195,9 +205,14 @@ pub fn dial_websocket(
     let received = Instant::now();
     let parts: Vec<&str> = status_line.split_whitespace().collect();
     if parts.len() < 2 {
-        return Err(WsError::Protocol(format!("invalid HTTP status line: {:?}", status_line)));
+        return Err(WsError::Protocol(format!(
+            "invalid HTTP status line: {:?}",
+            status_line
+        )));
     }
-    let status_code: u16 = parts[1].parse().map_err(|_| WsError::Protocol("invalid status code".into()))?;
+    let status_code: u16 = parts[1]
+        .parse()
+        .map_err(|_| WsError::Protocol("invalid status code".into()))?;
 
     let mut resp_headers = HashMap::new();
     loop {
@@ -228,14 +243,25 @@ pub fn dial_websocket(
         });
     }
 
-    let upgrade = resp_headers.get("upgrade").map(|s| s.to_ascii_lowercase()).unwrap_or_default();
-    let connection = resp_headers.get("connection").map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+    let upgrade = resp_headers
+        .get("upgrade")
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    let connection = resp_headers
+        .get("connection")
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
     if !upgrade.contains("websocket") || !connection.contains("upgrade") {
-        return Err(WsError::Protocol("WSS handshake missing upgrade headers".into()));
+        return Err(WsError::Protocol(
+            "WSS handshake missing upgrade headers".into(),
+        ));
     }
 
     let expected_accept = expected_websocket_accept(&key);
-    let got_accept = resp_headers.get("sec-websocket-accept").map(|s| s.as_str()).unwrap_or("");
+    let got_accept = resp_headers
+        .get("sec-websocket-accept")
+        .map(|s| s.as_str())
+        .unwrap_or("");
     if got_accept != expected_accept {
         return Err(WsError::Protocol("WSS handshake invalid accept".into()));
     }
@@ -245,6 +271,9 @@ pub fn dial_websocket(
             reader,
             write_mu: Mutex::new(()),
             last_activity: Instant::now(),
+            incoming: Vec::new(),
+            message: Vec::new(),
+            message_opcode: 0,
         },
         resp_headers,
         started,
@@ -280,9 +309,6 @@ impl WebSocketConn {
     }
 
     pub fn read_data_message(&mut self) -> Result<(Vec<u8>, u8), WsError> {
-        let mut message = Vec::new();
-        let mut message_opcode = 0u8;
-
         loop {
             let (fin, opcode, payload) = self.read_frame()?;
             self.last_activity = Instant::now();
@@ -300,85 +326,117 @@ impl WebSocketConn {
                     return Err(WsError::Close { code, reason });
                 }
                 WS_OPCODE_TEXT | WS_OPCODE_BINARY => {
-                    if message_opcode != 0 {
-                        return Err(WsError::Protocol("WSS fragmented message overlapped".into()));
+                    if self.message_opcode != 0 {
+                        return Err(WsError::Protocol(
+                            "WSS fragmented message overlapped".into(),
+                        ));
                     }
-                    message_opcode = opcode;
-                    message.extend_from_slice(&payload);
+                    self.message_opcode = opcode;
+                    self.message.extend_from_slice(&payload);
                 }
                 WS_OPCODE_CONTINUATION => {
-                    if message_opcode == 0 {
+                    if self.message_opcode == 0 {
                         return Err(WsError::Protocol("WSS continuation without message".into()));
                     }
-                    message.extend_from_slice(&payload);
+                    self.message.extend_from_slice(&payload);
                 }
                 _ => {
-                    return Err(WsError::Protocol(format!("WSS unsupported opcode={}", opcode)));
+                    return Err(WsError::Protocol(format!(
+                        "WSS unsupported opcode={}",
+                        opcode
+                    )));
                 }
             }
 
-            if message.len() > WEBSOCKET_MAX_MESSAGE_SIZE {
+            if self.message.len() > WEBSOCKET_MAX_MESSAGE_SIZE {
                 return Err(WsError::Protocol("WSS message too large".into()));
             }
 
-            if fin && (message_opcode == WS_OPCODE_TEXT || message_opcode == WS_OPCODE_BINARY) {
-                return Ok((message, message_opcode));
+            if fin
+                && (self.message_opcode == WS_OPCODE_TEXT
+                    || self.message_opcode == WS_OPCODE_BINARY)
+            {
+                let opcode = self.message_opcode;
+                self.message_opcode = 0;
+                return Ok((std::mem::take(&mut self.message), opcode));
             }
         }
     }
 
     fn read_frame(&mut self) -> Result<(bool, u8, Vec<u8>), WsError> {
-        let mut header = [0u8; 2];
-        self.reader.read_exact(&mut header)?;
-
-        // Once the frame header has started, read the rest with a safe timeout
-        let _ = self.set_read_timeout(Some(Duration::from_secs(5)));
-
-        let fin = header[0] & 0x80 != 0;
-        let opcode = header[0] & 0x0F;
-        let masked = header[1] & 0x80 != 0;
-        let mut len = (header[1] & 0x7F) as u64;
-
-        if len == 126 {
-            let mut ext = [0u8; 2];
-            self.reader.read_exact(&mut ext)?;
-            len = u16::from_be_bytes(ext) as u64;
-        } else if len == 127 {
-            let mut ext = [0u8; 8];
-            self.reader.read_exact(&mut ext)?;
-            len = u64::from_be_bytes(ext);
-        }
-
-        if len > WEBSOCKET_MAX_MESSAGE_SIZE as u64 {
-            return Err(WsError::Protocol("WSS frame too large".into()));
-        }
-
-        let mut mask_key = [0u8; 4];
-        if masked {
-            self.reader.read_exact(&mut mask_key)?;
-        }
-
-        let mut payload = vec![0u8; len as usize];
-        if len > 0 {
-            self.reader.read_exact(&mut payload)?;
-        }
-
-        if masked {
-            for i in 0..payload.len() {
-                payload[i] ^= mask_key[i % 4];
+        loop {
+            if self.incoming.len() >= 2 {
+                let header = &self.incoming;
+                let fin = header[0] & 0x80 != 0;
+                let opcode = header[0] & 0x0f;
+                if header[0] & 0x70 != 0 {
+                    return Err(WsError::Protocol(
+                        "unexpected WebSocket extension bits".into(),
+                    ));
+                }
+                let masked = header[1] & 0x80 != 0;
+                let length_code = header[1] & 0x7f;
+                let extended = match length_code {
+                    126 => 2,
+                    127 => 8,
+                    _ => 0,
+                };
+                if header.len() >= 2 + extended {
+                    let length = match length_code {
+                        126 => u16::from_be_bytes([header[2], header[3]]) as u64,
+                        127 => u64::from_be_bytes(header[2..10].try_into().unwrap()),
+                        value => value as u64,
+                    };
+                    if length > WEBSOCKET_MAX_MESSAGE_SIZE as u64 {
+                        return Err(WsError::Protocol("WSS frame too large".into()));
+                    }
+                    if opcode >= 8 && (!fin || length > 125) {
+                        return Err(WsError::Protocol("invalid WebSocket control frame".into()));
+                    }
+                    let payload_start = 2 + extended + if masked { 4 } else { 0 };
+                    let frame_end = payload_start + length as usize;
+                    if header.len() >= frame_end {
+                        let mut payload = header[payload_start..frame_end].to_vec();
+                        if masked {
+                            let mask = &header[payload_start - 4..payload_start];
+                            for (index, byte) in payload.iter_mut().enumerate() {
+                                *byte ^= mask[index % 4];
+                            }
+                        }
+                        self.incoming.drain(..frame_end);
+                        return Ok((fin, opcode, payload));
+                    }
+                }
             }
+            let mut bytes = [0u8; 8192];
+            let received = self.reader.read(&mut bytes)?;
+            if received == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "WebSocket peer closed the connection",
+                )
+                .into());
+            }
+            self.incoming.extend_from_slice(&bytes[..received]);
+            self.last_activity = Instant::now();
+            // Both partial frame bytes and fragmented messages remain in the
+            // connection when a socket poll times out.
         }
-
-        Ok((fin, opcode, payload))
     }
 
-    fn write_frame(&mut self, opcode: u8, payload: &[u8], timeout: Duration) -> Result<(), WsError> {
+    fn write_frame(
+        &mut self,
+        opcode: u8,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<(), WsError> {
         let _guard = self.write_mu.lock().unwrap();
         let _ = self.set_write_timeout(Some(timeout));
 
         let rng = ring::rand::SystemRandom::new();
         let mut mask_key = [0u8; 4];
-        rng.fill(&mut mask_key).map_err(|_| WsError::Protocol("entropy error".into()))?;
+        rng.fill(&mut mask_key)
+            .map_err(|_| WsError::Protocol("entropy error".into()))?;
 
         let payload_len = payload.len();
         let mut header = Vec::with_capacity(14);
@@ -414,7 +472,8 @@ fn new_websocket_key() -> Result<String, String> {
     use base64::Engine;
     let rng = ring::rand::SystemRandom::new();
     let mut key = [0u8; 16];
-    rng.fill(&mut key).map_err(|_| "entropy error".to_string())?;
+    rng.fill(&mut key)
+        .map_err(|_| "entropy error".to_string())?;
     Ok(BASE64.encode(key))
 }
 

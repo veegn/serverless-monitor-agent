@@ -1,4 +1,4 @@
-use crate::types::{MAX_TRAFFIC_CORRECTION_GB, NetBytes};
+use crate::types::{NetBytes, MAX_TRAFFIC_CORRECTION_GB};
 use chrono::{Datelike, Local, NaiveDate, TimeZone};
 use std::collections::HashMap;
 use std::fs;
@@ -21,12 +21,30 @@ pub fn read_traffic_state<P: AsRef<Path>>(path: P) -> TrafficState {
         Err(_) => return TrafficState::default(),
     };
     TrafficState {
-        rx_prev: values.get("RX_PREV").and_then(|v| v.parse().ok()).unwrap_or(0),
-        tx_prev: values.get("TX_PREV").and_then(|v| v.parse().ok()).unwrap_or(0),
-        rx_period: values.get("RX_PERIOD").and_then(|v| v.parse().ok()).unwrap_or(0),
-        tx_period: values.get("TX_PERIOD").and_then(|v| v.parse().ok()).unwrap_or(0),
-        last_check: values.get("LAST_CHECK").and_then(|v| v.parse().ok()).unwrap_or(0),
-        period_start: values.get("PERIOD_START").and_then(|v| v.parse().ok()).unwrap_or(0),
+        rx_prev: values
+            .get("RX_PREV")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        tx_prev: values
+            .get("TX_PREV")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        rx_period: values
+            .get("RX_PERIOD")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        tx_period: values
+            .get("TX_PERIOD")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        last_check: values
+            .get("LAST_CHECK")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        period_start: values
+            .get("PERIOD_START")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
         interface: values.get("INTERFACE").cloned().unwrap_or_default(),
     }
 }
@@ -75,47 +93,92 @@ pub fn write_traffic_state<P: AsRef<Path>>(path: P, st: &TrafficState) -> std::i
     fs::rename(&tmp, path)
 }
 
+/// In-memory accounting stays current on every observation; disk checkpoints
+/// are coalesced so one-second live reports do not rewrite the state file.
+pub struct TrafficTracker {
+    state: TrafficState,
+    next_checkpoint: std::time::Instant,
+}
+
+impl TrafficTracker {
+    pub fn new(path: &str) -> Self {
+        Self {
+            state: read_traffic_state(path),
+            next_checkpoint: std::time::Instant::now(),
+        }
+    }
+
+    pub fn sample(
+        &mut self,
+        path: &str,
+        current: NetBytes,
+        reset_day: u32,
+        iface: &str,
+        now: chrono::DateTime<Local>,
+        monotonic_now: std::time::Instant,
+    ) -> std::io::Result<(u64, u64)> {
+        update_traffic_state(&mut self.state, current, reset_day, iface, now);
+        if monotonic_now >= self.next_checkpoint {
+            self.checkpoint(path)?;
+            self.next_checkpoint = monotonic_now + std::time::Duration::from_secs(30);
+        }
+        Ok(self.totals())
+    }
+
+    pub fn totals(&self) -> (u64, u64) {
+        (self.state.rx_period, self.state.tx_period)
+    }
+
+    pub fn checkpoint(&self, path: &str) -> std::io::Result<()> {
+        write_traffic_state(path, &self.state)
+    }
+}
+
+fn update_traffic_state(
+    st: &mut TrafficState,
+    current: NetBytes,
+    reset_day: u32,
+    iface: &str,
+    now: chrono::DateTime<Local>,
+) {
+    if st.interface != iface {
+        *st = TrafficState::default();
+    }
+    let period_start = period_start_ts(now, reset_day);
+    if st.last_check == 0 {
+        st.rx_prev = current.rx;
+        st.tx_prev = current.tx;
+        st.last_check = now.timestamp();
+        st.period_start = period_start;
+        st.interface = iface.to_string();
+        return;
+    }
+    let rx_delta = current.rx.saturating_sub(st.rx_prev);
+    let tx_delta = current.tx.saturating_sub(st.tx_prev);
+    if period_start != 0 && st.period_start != 0 && period_start != st.period_start {
+        st.rx_period = rx_delta;
+        st.tx_period = tx_delta;
+    } else {
+        st.rx_period = st.rx_period.saturating_add(rx_delta);
+        st.tx_period = st.tx_period.saturating_add(tx_delta);
+    }
+    st.rx_prev = current.rx;
+    st.tx_prev = current.tx;
+    st.last_check = now.timestamp();
+    st.period_start = period_start;
+    st.interface = iface.to_string();
+}
+
 pub fn calc_monthly_traffic<P: AsRef<Path>>(
     path: P,
     current: NetBytes,
     reset_day: u32,
     iface: &str,
 ) -> std::io::Result<(u64, u64)> {
-    let now_dt = Local::now();
-    let now = now_dt.timestamp();
-    let mut st = read_traffic_state(&path);
-    if st.interface != iface {
-        st = TrafficState::default();
-    }
-    let period_start = period_start_ts(now_dt, reset_day);
-    if st.last_check == 0 {
-        st.rx_prev = current.rx;
-        st.tx_prev = current.tx;
-        st.last_check = now;
-        st.period_start = period_start;
-        st.interface = iface.to_string();
-        write_traffic_state(&path, &st)?;
-        return Ok((st.rx_period, st.tx_period));
-    }
-
-    let rx_delta = current.rx.saturating_sub(st.rx_prev);
-    let tx_delta = current.tx.saturating_sub(st.tx_prev);
-
-    if period_start != 0 && st.period_start != 0 && period_start != st.period_start {
-        st.rx_period = rx_delta;
-        st.tx_period = tx_delta;
-    } else {
-        st.rx_period += rx_delta;
-        st.tx_period += tx_delta;
-    }
-
-    st.rx_prev = current.rx;
-    st.tx_prev = current.tx;
-    st.last_check = now;
-    st.period_start = period_start;
-    st.interface = iface.to_string();
-    write_traffic_state(&path, &st)?;
-    Ok((st.rx_period, st.tx_period))
+    let mut state = read_traffic_state(&path);
+    update_traffic_state(&mut state, current, reset_day, iface, Local::now());
+    write_traffic_state(&path, &state)?;
+    Ok((state.rx_period, state.tx_period))
 }
 
 pub fn apply_traffic_correction_from_network<P: AsRef<Path>>(
@@ -187,9 +250,10 @@ pub fn actual_reset_date(year: i32, month: u32, reset_day: u32) -> chrono::DateT
     };
     let date = NaiveDate::from_ymd_opt(target_year, target_month, target_day).unwrap();
     let naive_dt = date.and_hms_opt(0, 0, 0).unwrap();
-    Local.from_local_datetime(&naive_dt).single().unwrap_or_else(|| {
-        Local::now()
-    })
+    Local
+        .from_local_datetime(&naive_dt)
+        .single()
+        .unwrap_or_else(Local::now)
 }
 
 fn days_in_month(year: i32, month: u32) -> u32 {
@@ -208,7 +272,9 @@ pub fn parse_traffic_correction_gb(raw: &str) -> Result<u64, String> {
     if s.is_empty() {
         return Ok(0);
     }
-    let f: f64 = s.parse().map_err(|_| format!("invalid traffic correction value: {}", raw))?;
+    let f: f64 = s
+        .parse()
+        .map_err(|_| format!("invalid traffic correction value: {}", raw))?;
     if f < 0.0 || f > MAX_TRAFFIC_CORRECTION_GB {
         return Err(format!("invalid traffic correction value: {}", raw));
     }
