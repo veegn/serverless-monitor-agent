@@ -1,4 +1,5 @@
 use super::*;
+use crate::transport::ReportTransport;
 use crate::types::Paths;
 use crate::util::log::Logger;
 use std::net::TcpListener;
@@ -7,8 +8,7 @@ use std::sync::{
     Arc,
 };
 
-#[path = "../../tests/support/websocket.rs"]
-mod ws;
+use crate::test_websocket as ws;
 
 struct Fixture {
     root: std::path::PathBuf,
@@ -375,4 +375,153 @@ fn oversized_latest_frame_does_not_cause_a_busy_retry_loop() {
         .process_adaptive_reporting(&f.agent.config_snapshot(), &metrics, now);
     assert!(f.agent.reporting.lock().unwrap().latest.is_none());
     assert!(f.agent.next_reporting_deadline().unwrap() >= now + Duration::from_secs(2));
+}
+
+#[test]
+fn retry_only_tick_keeps_the_original_history_without_collecting_metrics() {
+    let f = Fixture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    f.agent.cfg.write().unwrap().worker_url =
+        format!("http://{}/update", listener.local_addr().unwrap());
+    let (received, receive) = std::sync::mpsc::channel();
+    let (done, finish) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let mut stream = ws::accept(&listener);
+        ws::hello(&mut stream, false, 60000);
+        let initial = ws::read_json(&mut stream);
+        ws::send(
+            &mut stream,
+            &serde_json::json!({"type":"ack","ackFor":"report","reportId":initial["reportId"],"accepted":true}),
+        );
+        let first = ws::read_json(&mut stream);
+        let retry = ws::read_json(&mut stream);
+        received.send((first, retry)).unwrap();
+        finish.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+    let transport = ReportTransport::new(f.agent.clone());
+    *f.agent.reporter.lock().unwrap() = Some(transport.clone());
+    transport.start();
+    ws::wait_until(|| transport.connected());
+    f.agent.tick();
+    ws::wait_until(|| {
+        !f.agent
+            .adaptive_reporting
+            .lock()
+            .unwrap()
+            .initial_snapshot_pending
+    });
+    let (id, count) = f.idle_batch();
+    *f.agent.next_sample_due.lock().unwrap() = Instant::now() + Duration::from_secs(30);
+    f.agent
+        .reporting
+        .lock()
+        .unwrap()
+        .history
+        .as_mut()
+        .unwrap()
+        .retry_at = Instant::now();
+    let basic_at = *f.agent.basic_at.lock().unwrap();
+    let sample_at = *f.agent.last_sample.lock().unwrap();
+    let net_at = *f.agent.prev_time.lock().unwrap();
+    assert!(!f.agent.needs_fresh_report_metrics(Instant::now()));
+    f.agent.tick();
+    let (first, retry) = receive.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(
+        first, retry,
+        "a retry must preserve the complete original report"
+    );
+    assert_eq!(retry["reportId"], id);
+    assert_eq!(f.agent.cache.lock().unwrap().count(), count);
+    assert_eq!(*f.agent.basic_at.lock().unwrap(), basic_at);
+    assert_eq!(*f.agent.last_sample.lock().unwrap(), sample_at);
+    assert_eq!(*f.agent.prev_time.lock().unwrap(), net_at);
+    transport.stop("test complete");
+    done.send(()).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn fresh_frames_never_use_missing_metrics_and_initial_retries_need_no_collection() {
+    let f = Fixture::new();
+    f.agent.apply_wss_mode(false, 60000, 1, true);
+    let now = Instant::now();
+    assert!(f.agent.needs_fresh_report_metrics(now));
+    f.agent
+        .process_reporting(&f.agent.config_snapshot(), None, now);
+    assert!(f.agent.reporting.lock().unwrap().latest.is_none());
+    let metrics = Metrics {
+        cpu: "77".into(),
+        ..Metrics::default()
+    };
+    f.agent
+        .process_reporting(&f.agent.config_snapshot(), Some(&metrics), now);
+    let first = f
+        .agent
+        .reporting
+        .lock()
+        .unwrap()
+        .latest
+        .as_ref()
+        .unwrap()
+        .body
+        .clone();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&first).unwrap()["metrics"]["cpu"],
+        "77"
+    );
+    f.agent
+        .reporting
+        .lock()
+        .unwrap()
+        .latest
+        .as_mut()
+        .unwrap()
+        .retry_at = now;
+    assert!(!f.agent.needs_fresh_report_metrics(now));
+    f.agent
+        .process_reporting(&f.agent.config_snapshot(), None, now);
+    assert_eq!(
+        f.agent
+            .reporting
+            .lock()
+            .unwrap()
+            .latest
+            .as_ref()
+            .unwrap()
+            .body,
+        first
+    );
+}
+
+#[test]
+fn empty_history_checks_do_not_collect_but_new_samples_still_require_fresh_metrics() {
+    let f = Fixture::new();
+    f.agent.apply_wss_mode(false, 60000, 1, false);
+    let now = Instant::now();
+    f.agent.adaptive_reporting.lock().unwrap().next_report_due = Some(now);
+    assert!(!f.agent.needs_fresh_report_metrics(now));
+    f.agent
+        .process_reporting(&f.agent.config_snapshot(), None, now);
+    assert!(
+        f.agent
+            .adaptive_reporting
+            .lock()
+            .unwrap()
+            .next_report_due
+            .unwrap()
+            > now
+    );
+    f.sample(1000);
+    f.agent.adaptive_reporting.lock().unwrap().next_report_due = Some(now);
+    assert!(f.agent.needs_fresh_report_metrics(now));
+    f.agent
+        .process_reporting(&f.agent.config_snapshot(), None, now);
+    assert!(f.agent.reporting.lock().unwrap().history.is_none());
+    f.agent.tick();
+    assert_eq!(
+        f.agent.cache.lock().unwrap().count(),
+        2,
+        "periodic sampling continues while offline"
+    );
+    assert!(f.agent.basic_at.lock().unwrap().is_some());
 }

@@ -97,18 +97,29 @@ impl Agent {
                 *maintenance = Some(now);
             }
         }
-        let metrics = self.collect_current_metrics(now, &cfg);
+        let metrics =
+            if sample_due || discovery_due || (connected && self.needs_fresh_report_metrics(now)) {
+                Some(self.collect_current_metrics(now, &cfg))
+            } else {
+                None
+            };
         if sample_due {
             if !discovery_due {
-                self.append_sample(now, &metrics);
+                self.append_sample(
+                    now,
+                    metrics.as_ref().expect("sample requires fresh metrics"),
+                );
             }
             let finished = Instant::now();
             let mut next = self.next_sample_due.lock().unwrap();
             *next = advance_deadline(*next, super::reporter::ADAPTIVE_SAMPLE_INTERVAL, finished);
         }
         if discovery_due {
-            if let Ok((body, sample_count)) = self.build_report_body_for_config(&cfg, &metrics, now)
-            {
+            if let Ok((body, sample_count)) = self.build_report_body_for_config(
+                &cfg,
+                metrics.as_ref().expect("discovery requires fresh metrics"),
+                now,
+            ) {
                 let status = self.post_report_body(&cfg, &body, sample_count, false);
                 if (200..300).contains(&status) {
                     self.persist_pending_server_id();
@@ -120,7 +131,7 @@ impl Agent {
             return;
         }
         if connected {
-            self.process_adaptive_reporting(&cfg, &metrics, now);
+            self.process_reporting(&cfg, metrics.as_ref(), now);
         }
     }
 }

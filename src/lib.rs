@@ -23,5 +23,9 @@ pub mod types;
 pub mod update;
 pub mod util;
 
+#[cfg(test)]
+#[path = "../tests/support/websocket.rs"]
+pub(crate) mod test_websocket;
+
 pub use agent::AgentError;
 pub use cli::execute;

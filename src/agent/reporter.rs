@@ -63,6 +63,24 @@ impl Default for ReportingState {
     }
 }
 
+impl ReportingState {
+    fn latest_due(&self, state: &super::AdaptiveReportingState, now: Instant) -> bool {
+        now >= self.build_retry_at
+            && ((state.initial_snapshot_pending && self.latest.is_none())
+                || (state.mode == AdaptiveMode::Realtime
+                    && (state.force_report || state.next_report_due.is_some_and(|at| now >= at))))
+    }
+
+    fn history_due(&self, state: &super::AdaptiveReportingState, now: Instant) -> bool {
+        self.history.is_none()
+            && !state.initial_snapshot_pending
+            && now >= self.build_retry_at
+            && ((state.mode == AdaptiveMode::Realtime && now >= self.next_history_due)
+                || (state.mode == AdaptiveMode::IdleBatch
+                    && state.next_report_due.is_some_and(|at| now >= at)))
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PersistedPendingReport {
     kind: PendingReportKind,
@@ -197,26 +215,36 @@ impl Agent {
         due
     }
 
+    pub(super) fn needs_fresh_report_metrics(&self, now: Instant) -> bool {
+        let reporting = self.reporting.lock().unwrap();
+        let adaptive = self.adaptive_reporting.lock().unwrap();
+        reporting.latest_due(&adaptive, now)
+            || (reporting.history_due(&adaptive, now) && self.cache.lock().unwrap().count() > 0)
+    }
+
+    #[cfg(test)]
     pub(super) fn process_adaptive_reporting(&self, cfg: &Config, metrics: &Metrics, now: Instant) {
+        self.process_reporting(cfg, Some(metrics), now);
+    }
+
+    pub(super) fn process_reporting(&self, cfg: &Config, metrics: Option<&Metrics>, now: Instant) {
         // Keep the pending slots occupied through durable cleanup. ACK handling
         // takes this same lock, so a report cannot be replaced during its commit.
         let mut reporting = self.reporting.lock().unwrap();
-        let (mode, due, initial, force, generation, interval) = {
+        let (mode, due, initial, generation, interval, latest_due, history_due) = {
             let state = self.adaptive_reporting.lock().unwrap();
             (
                 state.mode,
                 state.next_report_due.is_some_and(|at| now >= at),
                 state.initial_snapshot_pending,
-                state.force_report,
                 state.generation,
                 state.interval,
+                reporting.latest_due(&state, now),
+                reporting.history_due(&state, now),
             )
         };
 
-        let latest_due = now >= reporting.build_retry_at
-            && ((initial && reporting.latest.is_none())
-                || (mode == AdaptiveMode::Realtime && (force || due)));
-        if latest_due {
+        if let Some(metrics) = metrics.filter(|_| latest_due) {
             let kind = if initial {
                 PendingReportKind::InitialSnapshot
             } else {
@@ -252,11 +280,7 @@ impl Agent {
             if now >= pending.retry_at {
                 self.dispatch_pending_report(pending, now);
             }
-        } else if !initial
-            && now >= reporting.build_retry_at
-            && ((mode == AdaptiveMode::Realtime && now >= reporting.next_history_due)
-                || (mode == AdaptiveMode::IdleBatch && due))
-        {
+        } else if history_due {
             let batch = self
                 .cache
                 .lock()
@@ -264,6 +288,10 @@ impl Agent {
                 .peek_batch_checked(BATCH_REPORT_SIZE);
             match batch {
                 Ok(batch) if !batch.is_empty() => {
+                    // A mode change/ACK may make a new report due after the
+                    // scheduler planned a retry-only tick. Collect on the next
+                    // tick rather than constructing a snapshot from defaults.
+                    let Some(metrics) = metrics else { return };
                     let values = batch.iter().map(cached_sample_value).collect();
                     match self.build_pending_report(
                         cfg,

@@ -30,6 +30,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::net::dns::use_public_dns_resolver;
+use crate::net::socket_wait::SocketWake;
 use crate::net::websocket::{dial_websocket, WebSocketConn, WsError, WS_OPCODE_TEXT};
 use crate::types::{Config, CONFIG_SCHEMA_VERSION, DEFAULT_WSS_REPORT_INTERVAL_SEC};
 use crate::util::log::Logger;
@@ -96,6 +97,7 @@ pub struct ReportTransport {
     host: Arc<dyn TransportHost>,
     inner: Arc<Mutex<Inner>>,
     outbound: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    socket_wake: Option<Arc<SocketWake>>,
     connected: Arc<AtomicBool>,
     wake_cv: Arc<Condvar>,
     shutdown: Arc<AtomicBool>,
@@ -128,6 +130,7 @@ impl ReportTransport {
                 server_overload_attempt: 0,
             })),
             outbound: Arc::new(Mutex::new(VecDeque::new())),
+            socket_wake: SocketWake::new().ok().map(Arc::new),
             connected: Arc::new(AtomicBool::new(false)),
             wake_cv: Arc::new(Condvar::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -224,6 +227,7 @@ impl ReportTransport {
         self.connected.store(false, AtomicOrdering::SeqCst);
 
         self.wake_cv.notify_all();
+        self.notify_socket();
         if !reason.is_empty() {
             self.host
                 .logger()
@@ -259,6 +263,9 @@ impl ReportTransport {
             return false;
         }
         outbound.push_back(body.to_vec());
+        drop(outbound);
+        drop(inner);
+        self.notify_socket();
         true
     }
 
@@ -275,6 +282,7 @@ impl ReportTransport {
 
         self.outbound.lock().unwrap().clear();
         self.connected.store(false, AtomicOrdering::SeqCst);
+        self.notify_socket();
 
         self.host.logger().info(&format!(
             "WSS retry delayed reason={} delay={}s",
@@ -288,6 +296,12 @@ impl ReportTransport {
             return false;
         }
         !self.is_stopped()
+    }
+
+    fn notify_socket(&self) {
+        if let Some(wake) = &self.socket_wake {
+            wake.notify();
+        }
     }
 
     fn run(&self) {
@@ -526,7 +540,14 @@ impl ReportTransport {
     fn read_loop(&self, conn: &mut WebSocketConn) -> Option<WsError> {
         let mut last_activity = Instant::now();
         let mut last_ping = Instant::now();
-        let short_poll = Duration::from_millis(25);
+        let mut event_wait = self.socket_wake.as_deref();
+        let fragment_timeout = Duration::from_millis(25);
+        let fallback_poll = Duration::from_millis(100);
+        let _ = conn.set_read_timeout(Some(if event_wait.is_some() {
+            fragment_timeout
+        } else {
+            fallback_poll
+        }));
 
         loop {
             if !self.should_run() {
@@ -560,7 +581,27 @@ impl ReportTransport {
                 last_ping = Instant::now();
             }
 
-            let _ = conn.set_read_timeout(Some(short_poll));
+            if let Some(wake) = event_wait {
+                let timeout = Duration::from_secs(1)
+                    .min(WSS_HEARTBEAT_INTERVAL.saturating_sub(last_ping.elapsed()))
+                    .min(idle_timeout.saturating_sub(last_activity.elapsed()));
+                match conn.wait_readable(wake, timeout) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        self.host.logger().warn_once(
+                            "wss-readiness",
+                            &format!(
+                                "socket readiness unavailable; using bounded polling: {}",
+                                error
+                            ),
+                        );
+                        event_wait = None;
+                        let _ = conn.set_read_timeout(Some(fallback_poll));
+                    }
+                }
+            }
             let msg_res = conn.read_data_message();
             let (payload, opcode) = match msg_res {
                 Ok(res) => {
@@ -916,6 +957,7 @@ impl Clone for ReportTransport {
             host: self.host.clone(),
             inner: self.inner.clone(),
             outbound: self.outbound.clone(),
+            socket_wake: self.socket_wake.clone(),
             connected: self.connected.clone(),
             wake_cv: self.wake_cv.clone(),
             shutdown: self.shutdown.clone(),

@@ -1,5 +1,6 @@
 use crate::net::dns::resolve_host;
 use crate::net::http::create_tls_config;
+use crate::net::socket_wait::SocketWake;
 use ring::rand::SecureRandom;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, StreamOwned};
@@ -19,6 +20,10 @@ pub const WS_OPCODE_PONG: u8 = 0xA;
 
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 1 << 20;
+
+#[cfg(test)]
+#[path = "websocket_tests.rs"]
+mod tests;
 
 #[derive(Debug)]
 pub enum WsError {
@@ -284,6 +289,58 @@ pub fn dial_websocket(
 impl WebSocketConn {
     pub fn last_activity(&self) -> Instant {
         self.last_activity
+    }
+
+    pub(crate) fn wait_readable(
+        &mut self,
+        wake: &SocketWake,
+        timeout: Duration,
+    ) -> std::io::Result<bool> {
+        if !self.reader.buffer().is_empty() || self.buffered_frame_ready() {
+            return Ok(true);
+        }
+        match self.reader.get_mut() {
+            WsUnderlyingStream::Plain(socket) => wake.wait(socket, timeout),
+            WsUnderlyingStream::Tls(stream) => {
+                // One TLS record may contain several frames. Plaintext already
+                // decoded by rustls must be consumed even when TCP is idle.
+                match stream.conn.reader().into_first_chunk() {
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    _ => return Ok(true),
+                }
+                wake.wait(&stream.sock, timeout)
+            }
+        }
+    }
+
+    fn buffered_frame_ready(&self) -> bool {
+        let bytes = &self.incoming;
+        if bytes.len() < 2 {
+            return false;
+        }
+        if bytes[0] & 0x70 != 0 {
+            return true;
+        }
+        let code = bytes[1] & 0x7f;
+        let extended = match code {
+            126 => 2,
+            127 => 8,
+            _ => 0,
+        };
+        if bytes.len() < 2 + extended {
+            return false;
+        }
+        let length = match code {
+            126 => u16::from_be_bytes([bytes[2], bytes[3]]) as u64,
+            127 => u64::from_be_bytes(bytes[2..10].try_into().unwrap()),
+            value => value as u64,
+        };
+        if bytes[0] & 0x0f >= 8 && (bytes[0] & 0x80 == 0 || length > 125) {
+            return true;
+        }
+        length > WEBSOCKET_MAX_MESSAGE_SIZE as u64
+            || bytes.len()
+                >= 2 + extended + (if bytes[1] & 0x80 != 0 { 4 } else { 0 }) + length as usize
     }
 
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {

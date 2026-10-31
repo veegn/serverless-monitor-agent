@@ -4,6 +4,7 @@ use serverless_monitor_agent::util::log::Logger;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,7 @@ struct MockHost {
     seen_modes: Mutex<Vec<ModeUpdate>>,
     applied_modes: Mutex<Vec<ModeUpdate>>,
     report_acks: Mutex<Vec<ReportAck>>,
+    run_checks: AtomicUsize,
 }
 
 impl MockHost {
@@ -46,6 +48,7 @@ impl MockHost {
             seen_modes: Mutex::new(Vec::new()),
             applied_modes: Mutex::new(Vec::new()),
             report_acks: Mutex::new(Vec::new()),
+            run_checks: AtomicUsize::new(0),
         }
     }
 }
@@ -64,6 +67,7 @@ impl TransportHost for MockHost {
     }
 
     fn uses_wss(&self) -> bool {
+        self.run_checks.fetch_add(1, Ordering::Relaxed);
         true
     }
 
@@ -426,6 +430,72 @@ fn enqueue_and_stop_do_not_wait_for_a_server_data_frame() {
         start.elapsed() < Duration::from_millis(500),
         "stop waited for socket I/O"
     );
+    done.send(()).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn idle_transport_waits_and_producers_wake_both_send_and_stop() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (received, receive) = std::sync::mpsc::channel();
+    let (closed, close) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let mut stream = ws::accept(&listener);
+        ws::hello(&mut stream, true, 2000);
+        received.send(ws::read_json(&mut stream)).unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            stream.read(&mut byte).unwrap(),
+            0,
+            "stop must close the idle socket"
+        );
+        closed.send(()).unwrap();
+    });
+    let host = Arc::new(MockHost::new(format!("http://{address}/update")));
+    let transport = ReportTransport::new(host.clone());
+    transport.start();
+    ws::wait_until(|| transport.connected());
+    host.run_checks.store(0, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(
+        host.run_checks.load(Ordering::Relaxed) <= 2,
+        "an idle connection is still being polled repeatedly"
+    );
+    assert!(transport.send(br#"{"reportId":"wake-send"}"#));
+    assert_eq!(
+        receive.recv_timeout(Duration::from_millis(750)).unwrap()["reportId"],
+        "wake-send"
+    );
+    transport.stop("test complete");
+    close.recv_timeout(Duration::from_millis(750)).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn coalesced_server_frames_do_not_wait_for_more_socket_data() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (done, finish) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let mut stream = ws::accept(&listener);
+        let mut bytes = ws::frame(
+            1,
+            true,
+            br#"{"type":"hello","protocol":"update","realtimeHint":true,"modeRevision":1}"#,
+        );
+        for report in ["first", "second"] {
+            bytes.extend(ws::frame(1, true, serde_json::json!({"type":"ack","ackFor":"report","reportId":report,"accepted":true}).to_string().as_bytes()));
+        }
+        stream.write_all(&bytes).unwrap();
+        finish.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+    let host = Arc::new(MockHost::new(format!("http://{address}/update")));
+    let transport = ReportTransport::new(host.clone());
+    transport.start();
+    ws::wait_until(|| host.report_acks.lock().unwrap().len() == 2);
+    assert_eq!(host.report_acks.lock().unwrap()[1].report_id, "second");
+    transport.stop("test complete");
     done.send(()).unwrap();
     server.join().unwrap();
 }

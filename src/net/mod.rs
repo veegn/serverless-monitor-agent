@@ -5,4 +5,5 @@ pub mod dns;
 pub mod http;
 pub mod iplookup;
 pub mod probe;
+pub(crate) mod socket_wait;
 pub mod websocket;
