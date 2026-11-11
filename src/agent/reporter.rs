@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 use super::{AdaptiveMode, Agent};
 use crate::storage::cache::{CachedSample, BATCH_REPORT_SIZE};
-use crate::transport::TransportHost;
+use crate::transport::{TransportHost, WsServerFrame};
 use crate::types::{Config, Metrics, CONFIG_SCHEMA_VERSION, MAX_BUFFERED_METRIC_SAMPLES};
 
 pub const CONFIG_STATE_REPORT_INTERVAL: Duration = Duration::from_secs(60);
@@ -16,6 +16,9 @@ pub const ADAPTIVE_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 pub const MAX_REPORT_FRAME_BYTES: usize = 512 * 1024;
 const REPORT_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 const REPORT_RETRY_MAX: Duration = Duration::from_secs(60);
+const HISTORY_DRAIN_DELAY: Duration = Duration::from_millis(100);
+const HISTORY_RETENTION_MS: i64 = 7 * 24 * 3600 * 1000;
+const HISTORY_FUTURE_TOLERANCE_MS: i64 = 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) enum PendingReportKind {
@@ -45,11 +48,35 @@ pub(super) struct PendingReport {
     source_samples: Vec<CachedSample>,
 }
 
+impl PendingReport {
+    fn truncate_history(&mut self, keep: usize, now: Instant) -> Result<(), String> {
+        let mut payload = self.payload.clone();
+        let samples = payload["samples"]
+            .as_array_mut()
+            .ok_or("pending history has no samples")?;
+        samples.truncate(keep);
+        let report_id = batch_report_id(&payload)?;
+        payload["reportId"] = serde_json::Value::String(report_id.clone());
+        let body = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+        self.report_id = report_id;
+        self.payload = payload;
+        self.body = body;
+        self.sample_count = keep;
+        self.consume_count = self.consume_count.min(keep);
+        self.source_samples.truncate(keep);
+        self.persisted = false;
+        self.retry_at = now;
+        self.attempts = 0;
+        Ok(())
+    }
+}
+
 pub(super) struct ReportingState {
     history: Option<PendingReport>,
     latest: Option<PendingReport>,
     pub(super) next_history_due: Instant,
     build_retry_at: Instant,
+    draining_history: bool,
 }
 
 impl Default for ReportingState {
@@ -59,11 +86,16 @@ impl Default for ReportingState {
             latest: None,
             next_history_due: Instant::now() + Duration::from_secs(60),
             build_retry_at: Instant::now(),
+            draining_history: false,
         }
     }
 }
 
 impl ReportingState {
+    fn uses_history_deadline(&self, mode: AdaptiveMode) -> bool {
+        self.draining_history || mode == AdaptiveMode::Realtime
+    }
+
     fn latest_due(&self, state: &super::AdaptiveReportingState, now: Instant) -> bool {
         now >= self.build_retry_at
             && ((state.initial_snapshot_pending && self.latest.is_none())
@@ -75,9 +107,11 @@ impl ReportingState {
         self.history.is_none()
             && !state.initial_snapshot_pending
             && now >= self.build_retry_at
-            && ((state.mode == AdaptiveMode::Realtime && now >= self.next_history_due)
-                || (state.mode == AdaptiveMode::IdleBatch
-                    && state.next_report_due.is_some_and(|at| now >= at)))
+            && if self.uses_history_deadline(state.mode) {
+                now >= self.next_history_due
+            } else {
+                state.next_report_due.is_some_and(|at| now >= at)
+            }
     }
 }
 
@@ -113,16 +147,10 @@ pub(super) fn restore_reporting_state(path: &str) -> Result<ReportingState, Stri
     if body.len() > MAX_REPORT_FRAME_BYTES || body_sample_count(&body) != persisted.sample_count {
         return Err("pending report size or sample count is invalid".to_string());
     }
-    let source_samples = if persisted.source_samples.is_empty()
-        && persisted.kind == PendingReportKind::CachedBatch
-    {
-        payload
-            .get("samples")
-            .and_then(|value| value.as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|sample| serde_json::from_value(sample.clone()).ok())
-            .collect()
+    let source_samples = if persisted.kind == PendingReportKind::CachedBatch {
+        // Older versions could save more source samples than they actually sent
+        // after a 1009 resize. Only the wire samples are eligible for removal.
+        serde_json::from_value(payload["samples"].clone()).map_err(|error| error.to_string())?
     } else {
         persisted.source_samples
     };
@@ -176,10 +204,11 @@ impl Agent {
             }
             reporting.latest = None;
         }
-        if realtime {
+        if realtime || initial {
             reporting.next_history_due = now;
         }
         if initial {
+            reporting.draining_history = self.cache.lock().unwrap().count() > 0;
             if let Some(pending) = reporting.history.as_mut() {
                 pending.retry_at = now;
             }
@@ -194,7 +223,10 @@ impl Agent {
         if let Some(latest) = &reporting.latest {
             due = Some(due.map_or(latest.retry_at, |at| at.min(latest.retry_at)));
         }
-        if adaptive.mode == AdaptiveMode::Realtime && reporting.history.is_none() {
+        if reporting.uses_history_deadline(adaptive.mode)
+            && reporting.history.is_none()
+            && !adaptive.initial_snapshot_pending
+        {
             let history_due = reporting.next_history_due.max(reporting.build_retry_at);
             due = Some(due.map_or(history_due, |at| at.min(history_due)));
         }
@@ -202,7 +234,11 @@ impl Agent {
             || (adaptive.initial_snapshot_pending && reporting.latest.is_none())
         {
             Some(Instant::now())
-        } else if adaptive.mode == AdaptiveMode::Realtime || reporting.history.is_none() {
+        } else if adaptive.mode == AdaptiveMode::Realtime
+            || (reporting.history.is_none()
+                && !reporting.draining_history
+                && !adaptive.initial_snapshot_pending)
+        {
             adaptive.next_report_due
         } else {
             None
@@ -287,11 +323,15 @@ impl Agent {
                 .unwrap()
                 .peek_batch_checked(BATCH_REPORT_SIZE);
             match batch {
-                Ok(batch) if !batch.is_empty() => {
+                Ok(mut batch) if !batch.is_empty() => {
                     // A mode change/ACK may make a new report due after the
                     // scheduler planned a retry-only tick. Collect on the next
                     // tick rather than constructing a snapshot from defaults.
                     let Some(metrics) = metrics else { return };
+                    let ordered = ordered_history_prefix(&batch);
+                    reporting.draining_history |=
+                        batch.len() == BATCH_REPORT_SIZE || ordered < batch.len();
+                    batch.truncate(ordered);
                     let values = batch.iter().map(cached_sample_value).collect();
                     match self.build_pending_report(
                         cfg,
@@ -312,6 +352,7 @@ impl Agent {
                     }
                 }
                 Ok(_) => {
+                    reporting.draining_history = false;
                     reporting.next_history_due = now + Duration::from_secs(60);
                     if mode == AdaptiveMode::IdleBatch && due {
                         let mut state = self.adaptive_reporting.lock().unwrap();
@@ -568,9 +609,11 @@ impl Agent {
             0
         };
         if is_history {
+            reporting.draining_history =
+                remaining > 0 && (reporting.draining_history || remaining >= BATCH_REPORT_SIZE);
             reporting.next_history_due = now
-                + if remaining >= BATCH_REPORT_SIZE {
-                    Duration::from_millis(100)
+                + if reporting.draining_history {
+                    HISTORY_DRAIN_DELAY
                 } else {
                     Duration::from_secs(60)
                 };
@@ -586,8 +629,8 @@ impl Agent {
             && (generation == state.generation || generation == 0)
         {
             state.next_report_due = Some(
-                now + if is_history && remaining >= BATCH_REPORT_SIZE {
-                    Duration::from_millis(100)
+                now + if is_history && reporting.draining_history {
+                    HISTORY_DRAIN_DELAY
                 } else {
                     jittered_idle_interval(state.interval, ADAPTIVE_SAMPLE_INTERVAL)
                 },
@@ -601,20 +644,97 @@ impl Agent {
         self.wake_tick();
     }
 
+    pub(super) fn recover_rejected_history(&self, report_id: &str, frame: &WsServerFrame) -> bool {
+        // The server rejects these errors before writing any part of the batch.
+        // Other rejections may be transient and must keep the original body.
+        if frame.code != 400
+            || frame.accepted != Some(false)
+            || frame.persisted != Some(false)
+            || frame.accepted_samples != Some(0)
+        {
+            return false;
+        }
+        let bounds = match frame.error.as_str() {
+            "Batch samples require valid, strictly increasing timestamps and metrics"
+            | "Invalid metrics batch sample" => None,
+            "Batch sample timestamp is invalid or outside the history retention window"
+                if frame.ts > 0 =>
+            {
+                Some((
+                    frame.ts.saturating_sub(HISTORY_RETENTION_MS),
+                    frame.ts.saturating_add(HISTORY_FUTURE_TOLERANCE_MS),
+                ))
+            }
+            _ => return false,
+        };
+        let now = Instant::now();
+        let mut reporting = self.reporting.lock().unwrap();
+        let Some(pending) = reporting.history.as_mut().filter(|pending| {
+            pending.kind == PendingReportKind::CachedBatch && pending.report_id == report_id
+        }) else {
+            return false;
+        };
+        let valid = |sample: &CachedSample| {
+            let ts = history_timestamp(sample);
+            ts > 0
+                && sample.metrics.is_object()
+                && bounds.is_none_or(|(min, max)| (min..=max).contains(&ts))
+        };
+        let invalid_prefix = pending
+            .source_samples
+            .iter()
+            .take_while(|sample| !valid(sample))
+            .count();
+        if invalid_prefix > 0 {
+            let removed = self
+                .cache
+                .lock()
+                .unwrap()
+                .acknowledge_batch(&pending.source_samples[..invalid_prefix]);
+            match removed {
+                Ok(count) => {
+                    if count > 0 {
+                        self.log.warn(&format!(
+                            "discarded {} rejected history samples with invalid metrics or timestamps (reportId={})",
+                            count, report_id
+                        ));
+                    }
+                }
+                Err(error) => {
+                    self.log.warn_once("cache-rejected-prefix", &error);
+                    return false;
+                }
+            }
+            self.clear_persisted_pending_report();
+            reporting.history = None;
+            reporting.next_history_due = now;
+        } else {
+            let valid_prefix = pending
+                .source_samples
+                .iter()
+                .take_while(|sample| valid(sample))
+                .count();
+            let keep = ordered_history_prefix(&pending.source_samples[..valid_prefix]);
+            if keep == 0 || keep == pending.sample_count {
+                return false;
+            }
+            if let Err(error) = pending.truncate_history(keep, now) {
+                self.log.warn_once("history-rebuild", &error);
+                return false;
+            }
+        }
+        reporting.draining_history = true;
+        drop(reporting);
+        self.wake_tick();
+        true
+    }
+
     pub(super) fn shrink_pending_report(&self) {
         let mut reporting = self.reporting.lock().unwrap();
         let Some(pending) = reporting.history.as_mut() else {
             return;
         };
-        let Some(samples) = pending
-            .payload
-            .get("samples")
-            .and_then(|v| v.as_array())
-            .cloned()
-        else {
-            return;
-        };
-        if samples.len() <= 1 {
+        if pending.sample_count <= 1 {
             pending.retry_at = Instant::now() + REPORT_RETRY_MAX;
             self.log.warn_once(
                 "wss-report-single-sample-too-large",
@@ -622,35 +742,16 @@ impl Agent {
             );
             return;
         }
-        let mut keep = if samples.len() > 30 {
+        let keep = if pending.sample_count > 30 {
             30
         } else {
-            (samples.len() / 2).max(1)
+            pending.sample_count / 2
         };
-        loop {
-            pending.payload["samples"] =
-                serde_json::Value::Array(samples[samples.len() - keep..].to_vec());
-            let result = batch_report_id(&pending.payload).and_then(|id| {
-                pending.payload["reportId"] = serde_json::Value::String(id.clone());
-                serde_json::to_vec(&pending.payload)
-                    .map(|body| (id, body))
-                    .map_err(|e| e.to_string())
-            });
-            match result {
-                Ok((id, body)) if body.len() <= MAX_REPORT_FRAME_BYTES => {
-                    pending.report_id = id;
-                    pending.body = body;
-                    pending.sample_count = keep;
-                    pending.persisted = false;
-                    pending.retry_at = Instant::now();
-                    break;
-                }
-                Ok(_) if keep > 1 => keep = (keep / 2).max(1),
-                _ => {
-                    pending.retry_at = Instant::now() + REPORT_RETRY_MAX;
-                    break;
-                }
-            }
+        if let Err(error) = pending.truncate_history(keep, Instant::now()) {
+            self.log.warn_once("history-resize", &error);
+            pending.retry_at = Instant::now() + REPORT_RETRY_MAX;
+        } else {
+            reporting.draining_history = true;
         }
         drop(reporting);
         self.wake_tick();
@@ -753,6 +854,22 @@ fn corrected_metrics_value(
 
 fn cached_sample_value(sample: &CachedSample) -> serde_json::Value {
     serde_json::json!({ "ts": sample.ts, "metrics": sample.metrics })
+}
+
+fn history_timestamp(sample: &CachedSample) -> i64 {
+    // Match the server's timestamp normalization for older cache records.
+    if (1..10_000_000_000).contains(&sample.ts) {
+        sample.ts * 1000
+    } else {
+        sample.ts
+    }
+}
+
+fn ordered_history_prefix(samples: &[CachedSample]) -> usize {
+    samples
+        .windows(2)
+        .position(|pair| history_timestamp(&pair[0]) >= history_timestamp(&pair[1]))
+        .map_or(samples.len(), |index| index + 1)
 }
 
 fn batch_report_id(payload: &serde_json::Value) -> Result<String, String> {

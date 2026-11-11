@@ -76,6 +76,9 @@ pub trait TransportHost: Send + Sync {
         _accepted_samples: Option<usize>,
     ) {
     }
+    fn recover_wss_report_rejection(&self, _report_id: &str, _frame: &WsServerFrame) -> bool {
+        false
+    }
     fn handle_wss_message_too_big(&self) {}
     fn wake_tick(&self);
 }
@@ -672,12 +675,16 @@ impl ReportTransport {
                                 if accepted {
                                     self.reset_server_overload_backoff();
                                 }
-                                self.host.apply_wss_report_ack(
-                                    report_id,
-                                    accepted,
-                                    frame.persisted,
-                                    frame.accepted_samples,
-                                );
+                                if accepted
+                                    || !self.host.recover_wss_report_rejection(report_id, &frame)
+                                {
+                                    self.host.apply_wss_report_ack(
+                                        report_id,
+                                        accepted,
+                                        frame.persisted,
+                                        frame.accepted_samples,
+                                    );
+                                }
                             } else {
                                 self.host
                                     .logger()

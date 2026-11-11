@@ -209,8 +209,8 @@ fn oversized_history_is_resized_and_ack_removes_only_its_original_samples() {
         let pending = reports.history.as_ref().unwrap();
         assert_ne!(pending.report_id, old_id);
         assert_eq!(pending.sample_count, 30);
-        assert_eq!(pending.source_samples.len(), 50);
-        assert_eq!(pending.payload["samples"][0]["ts"], 42000);
+        assert_eq!(pending.source_samples.len(), 30);
+        assert_eq!(pending.payload["samples"][0]["ts"], 2000);
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&pending.body).unwrap(),
             pending.payload
@@ -223,7 +223,68 @@ fn oversized_history_is_resized_and_ack_removes_only_its_original_samples() {
     assert_eq!(f.agent.cache.lock().unwrap().count(), 51);
     f.agent
         .handle_wss_report_ack(&id, true, Some(true), Some(count));
-    assert_eq!(f.agent.cache.lock().unwrap().peek_batch(10)[0].ts, 102000);
+    assert_eq!(f.agent.cache.lock().unwrap().count(), 21);
+    assert_eq!(f.agent.cache.lock().unwrap().peek_batch(10)[0].ts, 62000);
+}
+
+#[test]
+fn out_of_order_samples_are_sent_in_separate_batches_and_the_short_tail_drains() {
+    let f = Fixture::new();
+    for ts in [1000, 3000, 2000, 4000] {
+        f.sample(ts);
+    }
+    let (id, count) = f.idle_batch();
+    assert_eq!(count, 2);
+    f.agent
+        .handle_wss_report_ack(&id, true, Some(true), Some(count));
+
+    let next = f.agent.next_reporting_deadline().unwrap();
+    assert!(next <= Instant::now() + HISTORY_DRAIN_DELAY);
+    f.agent.process_adaptive_reporting(
+        &f.agent.config_snapshot(),
+        &Metrics::default(),
+        next,
+    );
+    let (id, count) = {
+        let reports = f.agent.reporting.lock().unwrap();
+        let pending = reports.history.as_ref().unwrap();
+        assert_eq!(pending.payload["samples"][0]["ts"], 2000);
+        assert_eq!(pending.payload["samples"][1]["ts"], 4000);
+        (pending.report_id.clone(), pending.sample_count)
+    };
+    f.agent
+        .handle_wss_report_ack(&id, true, Some(true), Some(count));
+    assert_eq!(f.agent.cache.lock().unwrap().count(), 0);
+    assert!(f.agent.next_reporting_deadline().unwrap() > Instant::now() + Duration::from_secs(50));
+}
+
+#[test]
+fn restart_of_legacy_resized_batch_cannot_acknowledge_unsent_samples() {
+    let f = Fixture::new();
+    for ts in [1000, 2000, 3000] {
+        f.sample(ts);
+    }
+    let (id, _) = f.idle_batch();
+    let mut saved: PersistedPendingReport =
+        serde_json::from_slice(&fs::read(&f.agent.pending_report_path).unwrap()).unwrap();
+    let mut payload: serde_json::Value = serde_json::from_str(&saved.body).unwrap();
+    payload["samples"].as_array_mut().unwrap().remove(0);
+    let resized_id = batch_report_id(&payload).unwrap();
+    payload["reportId"] = resized_id.clone().into();
+    saved.body = serde_json::to_string(&payload).unwrap();
+    saved.sample_count = 2;
+    fs::write(&f.agent.pending_report_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+
+    let restarted = Agent::new(
+        f.agent.config_snapshot(),
+        f.agent.paths.clone(),
+        Logger::new(false),
+        "test",
+    );
+    assert_ne!(id, resized_id);
+    restarted.handle_wss_report_ack(&resized_id, true, Some(true), Some(2));
+    assert_eq!(restarted.cache.lock().unwrap().count(), 3);
+    assert_eq!(restarted.cache.lock().unwrap().peek_batch(1)[0].ts, 1000);
 }
 
 #[test]
@@ -435,6 +496,93 @@ fn retry_only_tick_keeps_the_original_history_without_collecting_metrics() {
     assert_eq!(*f.agent.basic_at.lock().unwrap(), basic_at);
     assert_eq!(*f.agent.last_sample.lock().unwrap(), sample_at);
     assert_eq!(*f.agent.prev_time.lock().unwrap(), net_at);
+    transport.stop("test complete");
+    done.send(()).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn reconnect_drains_valid_samples_after_a_restored_batch_is_rejected() {
+    let mut f = Fixture::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    f.agent.cfg.write().unwrap().worker_url =
+        format!("http://{}/update", listener.local_addr().unwrap());
+    let server_ts = chrono::Utc::now().timestamp_millis();
+    let expired = server_ts - 8 * 24 * 3600 * 1000;
+    let future = server_ts + 120_000;
+    let valid = [server_ts - 4000, server_ts - 2000];
+    for ts in [expired, valid[0], future, valid[1]] {
+        f.sample(ts);
+    }
+    let (old_id, _) = f.idle_batch();
+    f.agent = Arc::new(Agent::new(
+        f.agent.config_snapshot(),
+        f.agent.paths.clone(),
+        Logger::new(false),
+        "test",
+    ));
+    *f.agent.next_sample_due.lock().unwrap() = Instant::now() + Duration::from_secs(30);
+
+    let (done, finish) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let mut stream = ws::accept(&listener);
+        ws::hello(&mut stream, false, 60000);
+        let initial = ws::read_json(&mut stream);
+        assert_eq!(initial["batch"], false);
+        ws::send(
+            &mut stream,
+            &serde_json::json!({"type":"ack","ackFor":"report","reportId":initial["reportId"],"accepted":true}),
+        );
+        let mut accepted = Vec::new();
+        for attempt in 0..5 {
+            let report = ws::read_json(&mut stream);
+            if attempt == 0 {
+                assert_eq!(report["reportId"], old_id);
+                assert_eq!(report["samples"][0]["ts"], expired);
+            } else {
+                assert_ne!(report["reportId"], old_id);
+            }
+            let timestamps: Vec<_> = report["samples"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|sample| sample["ts"].as_i64().unwrap())
+                .collect();
+            if timestamps.iter().any(|ts| *ts == expired || *ts == future) {
+                ws::send(
+                    &mut stream,
+                    &serde_json::json!({
+                        "type":"ack", "ackFor":"report", "reportId":report["reportId"], "ts":server_ts,
+                        "accepted":false, "persisted":false, "acceptedSamples":0, "code":400,
+                        "error":"Batch sample timestamp is invalid or outside the history retention window"
+                    }),
+                );
+            } else {
+                ws::send(
+                    &mut stream,
+                    &serde_json::json!({
+                        "type":"ack", "ackFor":"report", "reportId":report["reportId"],
+                        "accepted":true, "persisted":true, "acceptedSamples":timestamps.len()
+                    }),
+                );
+                accepted.extend(timestamps);
+                if accepted.len() >= valid.len() {
+                    break;
+                }
+            }
+        }
+        assert_eq!(accepted, valid);
+        finish.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+
+    let transport = ReportTransport::new(f.agent.clone());
+    *f.agent.reporter.lock().unwrap() = Some(transport.clone());
+    transport.start();
+    ws::wait_until(|| {
+        f.agent.tick();
+        f.agent.cache.lock().unwrap().count() == 0
+    });
+    assert!(!Path::new(&f.agent.pending_report_path).exists());
     transport.stop("test complete");
     done.send(()).unwrap();
     server.join().unwrap();

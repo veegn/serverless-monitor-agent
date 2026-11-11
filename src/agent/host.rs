@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::transport::{
-    is_wss_schedule_inactive_reason, TransportHost, AGENT_WSS_MODE_ACTIVE, AGENT_WSS_MODE_DISABLED,
-    AGENT_WSS_MODE_HEADER, AGENT_WSS_MODE_INACTIVE, AGENT_WSS_REASON_HEADER,
-    AGENT_WSS_SCHEDULE_INACTIVE,
+    is_wss_schedule_inactive_reason, TransportHost, WsServerFrame, AGENT_WSS_MODE_ACTIVE,
+    AGENT_WSS_MODE_DISABLED, AGENT_WSS_MODE_HEADER, AGENT_WSS_MODE_INACTIVE,
+    AGENT_WSS_REASON_HEADER, AGENT_WSS_SCHEDULE_INACTIVE,
 };
 use crate::types::Config;
 use crate::util::log::Logger;
@@ -229,6 +229,10 @@ impl TransportHost for Agent {
         accepted_samples: Option<usize>,
     ) {
         self.handle_wss_report_ack(report_id, accepted, persisted, accepted_samples);
+    }
+
+    fn recover_wss_report_rejection(&self, report_id: &str, frame: &WsServerFrame) -> bool {
+        self.recover_rejected_history(report_id, frame)
     }
 
     fn handle_wss_message_too_big(&self) {
